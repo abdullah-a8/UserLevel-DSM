@@ -11,6 +11,7 @@
 
 #include "dsm/types.h"
 #include <stdint.h>
+#include <pthread.h>
 
 /* ============================ */
 /*     Message Types            */
