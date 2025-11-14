@@ -1,0 +1,48 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Compiled executables
+dsm_manager
+dsm_worker
+game_of_life
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+core.*
+vgcore.*
+
+# Dependency files
+*.d
+
+# Test outputs
+test_results/
+*.log
+
+# Local documentation/planning (private)
+LocalDocs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# System files
+.gdb_history
+tags
+TAGS
