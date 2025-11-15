@@ -16,6 +16,7 @@ typedef struct {
     barrier_id_t id;
     int expected_count;
     int arrived_count;
+    int generation;           /* Sense-reversing barrier generation */
     pthread_mutex_t lock;
     pthread_cond_t all_arrived_cv;
 } dsm_barrier_t;

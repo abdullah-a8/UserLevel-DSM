@@ -298,27 +298,31 @@ int handle_lock_request(const message_t *msg) {
 
     LOG_DEBUG("Handling LOCK_REQUEST for lock %lu from node %u", lock_id, requester);
 
-    /* Simple implementation: immediately grant */
-    return send_lock_grant(requester, lock_id);
+    /* Forward to lock manager (implemented in sync/lock.c) */
+    extern int lock_manager_grant(lock_id_t lock_id, node_id_t requester);
+    return lock_manager_grant(lock_id, requester);
 }
 
 int handle_lock_grant(const message_t *msg) {
     lock_id_t lock_id = msg->payload.lock_grant.lock_id;
-    LOG_DEBUG("Received LOCK_GRANT for lock %lu", lock_id);
+    node_id_t grantee = msg->payload.lock_grant.grantee;
 
-    /* Signal waiting thread */
-    dsm_context_t *ctx = dsm_get_context();
-    pthread_mutex_lock(&ctx->lock_mgr.lock);
-    /* Wake up waiting threads - simplified */
-    pthread_mutex_unlock(&ctx->lock_mgr.lock);
+    LOG_DEBUG("Received LOCK_GRANT for lock %lu (grantee=%u)", lock_id, grantee);
 
-    return DSM_SUCCESS;
+    /* Forward to lock handler (implemented in sync/lock.c) */
+    extern int lock_handle_grant(lock_id_t lock_id, node_id_t grantee);
+    return lock_handle_grant(lock_id, grantee);
 }
 
 int handle_lock_release(const message_t *msg) {
     lock_id_t lock_id = msg->payload.lock_release.lock_id;
-    LOG_DEBUG("Handling LOCK_RELEASE for lock %lu", lock_id);
-    return DSM_SUCCESS;
+    node_id_t releaser = msg->payload.lock_release.releaser;
+
+    LOG_DEBUG("Handling LOCK_RELEASE for lock %lu from node %u", lock_id, releaser);
+
+    /* Forward to lock manager (implemented in sync/lock.c) */
+    extern int lock_manager_release(lock_id_t lock_id, node_id_t releaser);
+    return lock_manager_release(lock_id, releaser);
 }
 
 /* BARRIER */
@@ -356,16 +360,24 @@ int send_barrier_release(node_id_t node, barrier_id_t barrier_id) {
 
 int handle_barrier_arrive(const message_t *msg) {
     barrier_id_t barrier_id = msg->payload.barrier_arrive.barrier_id;
-    LOG_DEBUG("Handling BARRIER_ARRIVE for barrier %lu", barrier_id);
+    node_id_t arriver = msg->payload.barrier_arrive.arriver;
+    int num_participants = msg->payload.barrier_arrive.num_participants;
 
-    /* Simple implementation: track count and release when all arrive */
-    return DSM_SUCCESS;
+    LOG_DEBUG("Handling BARRIER_ARRIVE for barrier %lu from node %u (%d participants)",
+              barrier_id, arriver, num_participants);
+
+    /* Forward to barrier manager (implemented in sync/barrier.c) */
+    extern int barrier_manager_arrive(barrier_id_t barrier_id, node_id_t arriver, int num_participants);
+    return barrier_manager_arrive(barrier_id, arriver, num_participants);
 }
 
 int handle_barrier_release(const message_t *msg) {
     barrier_id_t barrier_id = msg->payload.barrier_release.barrier_id;
     LOG_DEBUG("Received BARRIER_RELEASE for barrier %lu", barrier_id);
-    return DSM_SUCCESS;
+
+    /* Forward to barrier handler (implemented in sync/barrier.c) */
+    extern int barrier_handle_release(barrier_id_t barrier_id);
+    return barrier_handle_release(barrier_id);
 }
 
 /* Dispatcher */

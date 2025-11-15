@@ -5,6 +5,7 @@
 
 #include "dsm/dsm.h"
 #include "../src/network/handlers.h"
+#include "../src/sync/lock.h"
 #include "../src/core/log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,13 @@ int test_message_dispatch() {
 
     dsm_init(&config);
 
+    /* Create the lock first */
+    dsm_lock_t *lock = dsm_lock_create(1);
+    if (!lock) {
+        dsm_finalize();
+        return 0;
+    }
+
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -114,6 +122,7 @@ int test_message_dispatch() {
 
     int rc = dispatch_message(&msg);
 
+    dsm_lock_destroy(lock);
     dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;
 }
@@ -129,7 +138,18 @@ int test_lock_handlers() {
 
     dsm_init(&config);
 
-    /* Test LOCK_RELEASE (doesn't send) */
+    /* Create the lock first */
+    dsm_lock_t *lock = dsm_lock_create(5);
+    if (!lock) {
+        dsm_finalize();
+        return 0;
+    }
+
+    /* Acquire lock as node 2 (simulate) */
+    lock->holder = 2;
+    lock->state = LOCK_STATE_HELD;
+
+    /* Test LOCK_RELEASE */
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -139,6 +159,7 @@ int test_lock_handlers() {
 
     int rc = dispatch_message(&msg);
 
+    dsm_lock_destroy(lock);
     dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;
 }
