@@ -68,6 +68,10 @@ int dsm_context_init(const dsm_config_t *config) {
 
     /* Page table will be initialized when first DSM memory is allocated */
     ctx->page_table = NULL;
+    ctx->num_allocations = 0;
+    for (int i = 0; i < 32; i++) {
+        ctx->page_tables[i] = NULL;
+    }
 
     ctx->initialized = true;
 
@@ -120,10 +124,15 @@ void dsm_context_cleanup(void) {
     }
     pthread_mutex_destroy(&ctx->barrier_mgr.lock);
 
-    /* Cleanup page table */
-    if (ctx->page_table) {
-        page_table_destroy(ctx->page_table);
+    /* Cleanup all page tables */
+    for (int i = 0; i < ctx->num_allocations && i < 32; i++) {
+        if (ctx->page_tables[i]) {
+            page_table_destroy(ctx->page_tables[i]);
+            ctx->page_tables[i] = NULL;
+        }
     }
+    ctx->page_table = NULL;
+    ctx->num_allocations = 0;
 
     pthread_mutex_destroy(&ctx->lock);
     pthread_mutex_destroy(&ctx->stats_lock);

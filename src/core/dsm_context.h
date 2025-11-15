@@ -56,7 +56,9 @@ typedef struct {
     node_id_t node_id;
 
     /* Memory management */
-    page_table_t *page_table;
+    page_table_t *page_table;  /* Primary page table (for backward compatibility) */
+    page_table_t *page_tables[32];  /* Support up to 32 separate allocations */
+    int num_allocations;
 
     /* Network */
     network_state_t network;

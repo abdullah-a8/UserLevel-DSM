@@ -40,49 +40,65 @@ void* dsm_malloc(size_t size) {
         return NULL;
     }
 
-    /* Create or extend page table */
+    /* Create page table for this allocation */
     pthread_mutex_lock(&ctx->lock);
 
-    if (ctx->page_table == NULL) {
-        ctx->page_table = page_table_create(addr, aligned_size);
-        if (!ctx->page_table) {
-            pthread_mutex_unlock(&ctx->lock);
-            munmap(addr, aligned_size);
-            LOG_ERROR("Failed to create page table");
-            return NULL;
-        }
+    if (ctx->num_allocations >= 32) {
+        pthread_mutex_unlock(&ctx->lock);
+        munmap(addr, aligned_size);
+        LOG_ERROR("Maximum number of allocations (32) exceeded");
+        return NULL;
+    }
 
-        /* Initialize consistency module now that page table exists */
-        int rc = consistency_init(ctx->page_table->num_pages);
-        if (rc != DSM_SUCCESS) {
+    page_table_t *new_table = page_table_create(addr, aligned_size);
+    if (!new_table) {
+        pthread_mutex_unlock(&ctx->lock);
+        munmap(addr, aligned_size);
+        LOG_ERROR("Failed to create page table");
+        return NULL;
+    }
+
+    /* Add to list of page tables */
+    ctx->page_tables[ctx->num_allocations] = new_table;
+    ctx->num_allocations++;
+
+    /* Set primary page table for backward compatibility */
+    if (ctx->page_table == NULL) {
+        ctx->page_table = new_table;
+
+        /* Initialize consistency module now that first page table exists */
+        /* Note: We initialize with a reasonable max size (1000 pages) */
+        int rc = consistency_init(1000);
+        if (rc != DSM_SUCCESS && rc != DSM_ERROR_INIT) {
             LOG_ERROR("Failed to initialize consistency module");
-            page_table_destroy(ctx->page_table);
+            page_table_destroy(new_table);
+            ctx->page_tables[ctx->num_allocations - 1] = NULL;
+            ctx->num_allocations--;
             ctx->page_table = NULL;
             pthread_mutex_unlock(&ctx->lock);
             munmap(addr, aligned_size);
             return NULL;
         }
+    }
 
-        /* Set this node as owner of all allocated pages */
-        struct page_directory_s *dir = get_page_directory();
-        if (dir) {
-            for (size_t i = 0; i < num_pages; i++) {
+    /* Set this node as owner of all allocated pages */
+    struct page_directory_s *dir = get_page_directory();
+    if (dir) {
+        for (size_t i = 0; i < num_pages; i++) {
+            page_id_t global_page_id = new_table->entries[i].id;
+
+            /* Make sure page ID is within directory bounds */
+            if (global_page_id < dir->num_entries) {
                 /* Acquire per-entry lock for directory */
-                pthread_mutex_lock(&dir->entries[i].lock);
-                dir->entries[i].owner = ctx->node_id;
-                pthread_mutex_unlock(&dir->entries[i].lock);
-
-                /* Page table lock already held (ctx->lock) but set owner */
-                ctx->page_table->entries[i].owner = ctx->node_id;
+                pthread_mutex_lock(&dir->entries[global_page_id].lock);
+                dir->entries[global_page_id].owner = ctx->node_id;
+                pthread_mutex_unlock(&dir->entries[global_page_id].lock);
             }
-            LOG_INFO("Set node %u as owner of %zu pages", ctx->node_id, num_pages);
+
+            /* Set owner in page table (ctx->lock already held) */
+            new_table->entries[i].owner = ctx->node_id;
         }
-    } else {
-        /* For now, only support single allocation */
-        pthread_mutex_unlock(&ctx->lock);
-        munmap(addr, aligned_size);
-        LOG_ERROR("Multiple allocations not yet supported");
-        return NULL;
+        LOG_INFO("Set node %u as owner of %zu pages", ctx->node_id, num_pages);
     }
 
     pthread_mutex_unlock(&ctx->lock);
@@ -97,26 +113,49 @@ int dsm_free(void *ptr) {
     }
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->initialized || !ctx->page_table) {
+    if (!ctx->initialized || ctx->num_allocations == 0) {
         LOG_ERROR("DSM not initialized or no allocations");
         return DSM_ERROR_INVALID;
     }
 
     pthread_mutex_lock(&ctx->lock);
 
-    /* Verify pointer is the base address */
-    if (ptr != ctx->page_table->base_addr) {
+    /* Find which page table owns this pointer */
+    page_table_t *target_table = NULL;
+    int target_index = -1;
+
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i] && ctx->page_tables[i]->base_addr == ptr) {
+            target_table = ctx->page_tables[i];
+            target_index = i;
+            break;
+        }
+    }
+
+    if (!target_table) {
         pthread_mutex_unlock(&ctx->lock);
-        LOG_ERROR("dsm_free: invalid pointer %p (expected %p)",
-                  ptr, ctx->page_table->base_addr);
+        LOG_ERROR("dsm_free: invalid pointer %p (not a DSM allocation)", ptr);
         return DSM_ERROR_INVALID;
     }
 
-    size_t size = ctx->page_table->total_size;
+    size_t size = target_table->total_size;
 
     /* Destroy page table */
-    page_table_destroy(ctx->page_table);
-    ctx->page_table = NULL;
+    page_table_destroy(target_table);
+
+    /* Remove from list and compact */
+    for (int i = target_index; i < ctx->num_allocations - 1; i++) {
+        ctx->page_tables[i] = ctx->page_tables[i + 1];
+    }
+    ctx->page_tables[ctx->num_allocations - 1] = NULL;
+    ctx->num_allocations--;
+
+    /* Update primary page table reference */
+    if (ctx->num_allocations > 0) {
+        ctx->page_table = ctx->page_tables[0];
+    } else {
+        ctx->page_table = NULL;
+    }
 
     pthread_mutex_unlock(&ctx->lock);
 

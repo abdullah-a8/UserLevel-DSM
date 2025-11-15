@@ -9,10 +9,12 @@
 #include "perf_log.h"
 #include "../memory/fault_handler.h"
 #include "../consistency/page_migration.h"
+#include "../network/network.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
 
 int dsm_init(const dsm_config_t *config) {
     if (!config) {
@@ -37,6 +39,87 @@ int dsm_init(const dsm_config_t *config) {
         return rc;
     }
 
+    /* Initialize network layer */
+    if (config->num_nodes > 1) {
+        if (config->is_manager) {
+            /* Manager: Start server and wait for workers */
+            LOG_INFO("Starting network server on port %u", config->port);
+            rc = network_server_init(config->port);
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to initialize network server");
+                uninstall_fault_handler();
+                dsm_context_cleanup();
+                return rc;
+            }
+
+            /* Start message dispatcher */
+            rc = network_start_dispatcher();
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to start network dispatcher");
+                network_shutdown();
+                uninstall_fault_handler();
+                dsm_context_cleanup();
+                return rc;
+            }
+
+            /* Wait for all workers to connect */
+            LOG_INFO("Waiting for %d workers to connect...", config->num_nodes - 1);
+            dsm_context_t *ctx = dsm_get_context();
+            int expected_workers = config->num_nodes - 1;
+            int timeout_seconds = 60;
+
+            for (int i = 0; i < timeout_seconds * 10; i++) {
+                pthread_mutex_lock(&ctx->lock);
+                int connected = ctx->network.num_nodes;
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (connected >= expected_workers) {
+                    LOG_INFO("All %d workers connected", expected_workers);
+                    break;
+                }
+
+                usleep(100000);  /* 100ms */
+
+                if (i == timeout_seconds * 10 - 1) {
+                    LOG_ERROR("Timeout waiting for workers (got %d, expected %d)",
+                             connected, expected_workers);
+                    network_shutdown();
+                    uninstall_fault_handler();
+                    dsm_context_cleanup();
+                    return DSM_ERROR_TIMEOUT;
+                }
+            }
+
+            /* Give workers a moment to complete their setup */
+            sleep(1);
+
+        } else {
+            /* Worker: Connect to manager */
+            LOG_INFO("Connecting to manager at %s:%u",
+                    config->manager_host, config->manager_port);
+
+            rc = network_connect_to_node(0, config->manager_host, config->manager_port);
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to connect to manager");
+                uninstall_fault_handler();
+                dsm_context_cleanup();
+                return rc;
+            }
+
+            /* Start message dispatcher */
+            rc = network_start_dispatcher();
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to start network dispatcher");
+                network_shutdown();
+                uninstall_fault_handler();
+                dsm_context_cleanup();
+                return rc;
+            }
+
+            LOG_INFO("Connected to manager successfully");
+        }
+    }
+
     /* Note: consistency module will be initialized when dsm_malloc() creates page table */
 
     LOG_INFO("DSM initialized successfully");
@@ -45,6 +128,13 @@ int dsm_init(const dsm_config_t *config) {
 
 int dsm_finalize(void) {
     LOG_INFO("Finalizing DSM");
+
+    /* Shutdown network first */
+    dsm_context_t *ctx = dsm_get_context();
+    if (ctx->config.num_nodes > 1) {
+        network_shutdown();
+    }
+
     consistency_cleanup();
     uninstall_fault_handler();
     perf_log_cleanup();  /* Clean up performance logging resources */

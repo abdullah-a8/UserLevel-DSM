@@ -49,18 +49,28 @@ static void dsm_fault_handler(int sig, siginfo_t *info, void *context) {
     long tid = syscall(SYS_gettid);
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->initialized || !ctx->page_table) {
-        LOG_ERROR("[%ld] Fault at %p - DSM not initialized", tid, fault_addr);
+    if (!ctx->initialized || ctx->num_allocations == 0) {
+        LOG_ERROR("[%ld] Fault at %p - DSM not initialized or no allocations", tid, fault_addr);
         /* Re-raise signal to get default behavior */
         signal(SIGSEGV, SIG_DFL);
         raise(SIGSEGV);
         return;
     }
 
-    /* Check if fault is in DSM region */
-    page_entry_t *entry = page_table_lookup_by_addr(ctx->page_table, fault_addr);
+    /* Check if fault is in any DSM region */
+    page_entry_t *entry = NULL;
+
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_addr(ctx->page_tables[i], fault_addr);
+            if (entry) {
+                break;
+            }
+        }
+    }
+
     if (!entry) {
-        LOG_ERROR("[%ld] Fault at %p - not in DSM region", tid, fault_addr);
+        LOG_ERROR("[%ld] Fault at %p - not in any DSM region", tid, fault_addr);
         /* Not our fault, re-raise */
         signal(SIGSEGV, SIG_DFL);
         raise(SIGSEGV);
@@ -86,7 +96,16 @@ static void dsm_fault_handler(int sig, siginfo_t *info, void *context) {
 
 int handle_read_fault(void *addr) {
     dsm_context_t *ctx = dsm_get_context();
-    page_entry_t *entry = page_table_lookup_by_addr(ctx->page_table, addr);
+
+    /* Find entry in any page table */
+    page_entry_t *entry = NULL;
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_addr(ctx->page_tables[i], addr);
+            if (entry) break;
+        }
+    }
+
     if (!entry) {
         return DSM_ERROR_NOT_FOUND;
     }
@@ -114,7 +133,16 @@ int handle_read_fault(void *addr) {
 
 int handle_write_fault(void *addr) {
     dsm_context_t *ctx = dsm_get_context();
-    page_entry_t *entry = page_table_lookup_by_addr(ctx->page_table, addr);
+
+    /* Find entry in any page table */
+    page_entry_t *entry = NULL;
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_addr(ctx->page_tables[i], addr);
+            if (entry) break;
+        }
+    }
+
     if (!entry) {
         return DSM_ERROR_NOT_FOUND;
     }
