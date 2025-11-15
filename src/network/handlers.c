@@ -39,20 +39,38 @@ int handle_page_request(const message_t *msg) {
               page_id, requester, access);
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->page_table) {
-        LOG_ERROR("No page table");
+    if (ctx->num_allocations == 0) {
+        LOG_ERROR("No allocations");
         return DSM_ERROR_INIT;
     }
 
-    page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
-    if (!entry) {
-        LOG_ERROR("Page %lu not found", page_id);
+    /* Search all page tables for this page ID
+     * Hold ctx->lock to prevent race with dsm_free() compacting the array
+     * Acquire reference before unlocking to prevent the table from being freed */
+    page_entry_t *entry = NULL;
+    page_table_t *owning_table = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) {
+                owning_table = ctx->page_tables[i];
+                page_table_acquire(owning_table);  /* Acquire reference while holding ctx->lock */
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (!entry || !owning_table) {
+        LOG_ERROR("Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
 
     /* Send page data */
     int rc = send_page_reply(requester, page_id, entry->local_addr);
     if (rc != DSM_SUCCESS) {
+        page_table_release(owning_table);
         return rc;
     }
 
@@ -70,39 +88,42 @@ int handle_page_request(const message_t *msg) {
         rc = set_page_permission(entry->local_addr, PAGE_PERM_NONE);
         if (rc != DSM_SUCCESS) {
             LOG_ERROR("Failed to set page %lu permission to NONE", page_id);
+            page_table_release(owning_table);
             return rc;
         }
 
         /* Acquire page table lock before modifying entry state/owner */
-        pthread_mutex_lock(&ctx->page_table->lock);
+        pthread_mutex_lock(&owning_table->lock);
         entry->state = PAGE_STATE_INVALID;
         entry->owner = requester;
-        pthread_mutex_unlock(&ctx->page_table->lock);
+        pthread_mutex_unlock(&owning_table->lock);
     } else {
         /* For READ access, we keep our copy and can also share */
         LOG_DEBUG("Keeping page %lu as shared (node %u also has read access)",
                   page_id, requester);
 
-        pthread_mutex_lock(&ctx->page_table->lock);
+        pthread_mutex_lock(&owning_table->lock);
         if (entry->state == PAGE_STATE_READ_WRITE) {
-            pthread_mutex_unlock(&ctx->page_table->lock);
+            pthread_mutex_unlock(&owning_table->lock);
 
             /* Check return value of set_page_permission */
             rc = set_page_permission(entry->local_addr, PAGE_PERM_READ);
             if (rc != DSM_SUCCESS) {
                 LOG_ERROR("Failed to set page %lu permission to READ", page_id);
+                page_table_release(owning_table);
                 return rc;
             }
 
             /* Downgrade to READ_ONLY since someone else has a copy */
-            pthread_mutex_lock(&ctx->page_table->lock);
+            pthread_mutex_lock(&owning_table->lock);
             entry->state = PAGE_STATE_READ_ONLY;
-            pthread_mutex_unlock(&ctx->page_table->lock);
+            pthread_mutex_unlock(&owning_table->lock);
         } else {
-            pthread_mutex_unlock(&ctx->page_table->lock);
+            pthread_mutex_unlock(&owning_table->lock);
         }
     }
 
+    page_table_release(owning_table);
     return DSM_SUCCESS;
 }
 
@@ -131,12 +152,30 @@ int handle_page_reply(const message_t *msg) {
     LOG_DEBUG("Handling PAGE_REPLY for page %lu (version %lu)", page_id, version);
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->page_table) {
+    if (ctx->num_allocations == 0) {
         return DSM_ERROR_INIT;
     }
 
-    page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
-    if (!entry) {
+    /* Search all page tables for this page ID
+     * Hold ctx->lock to prevent race with dsm_free() compacting the array
+     * Acquire reference before unlocking to prevent the table from being freed */
+    page_entry_t *entry = NULL;
+    page_table_t *owning_table = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) {
+                owning_table = ctx->page_tables[i];
+                page_table_acquire(owning_table);  /* Acquire reference while holding ctx->lock */
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (!entry || !owning_table) {
+        LOG_ERROR("Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
 
@@ -161,6 +200,7 @@ int handle_page_reply(const message_t *msg) {
         LOG_DEBUG("Woke %d waiting threads for page %lu", waiters, page_id);
     }
 
+    page_table_release(owning_table);
     return DSM_SUCCESS;
 }
 
@@ -203,13 +243,27 @@ int handle_invalidate(const message_t *msg) {
     LOG_DEBUG("Handling INVALIDATE for page %lu (new_owner=%u)", page_id, new_owner);
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->page_table) {
-        return DSM_ERROR_INIT;
-    }
 
-    page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
-    if (!entry) {
-        LOG_WARN("Page %lu not found, ignoring invalidation", page_id);
+    /* Search all page tables for this page ID
+     * Hold ctx->lock to prevent race with dsm_free() compacting the array
+     * Acquire reference before unlocking to prevent the table from being freed */
+    page_entry_t *entry = NULL;
+    page_table_t *owning_table = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) {
+                owning_table = ctx->page_tables[i];
+                page_table_acquire(owning_table);  /* Acquire reference while holding ctx->lock */
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (!entry || !owning_table) {
+        LOG_WARN("Page %lu not found in any table, ignoring invalidation", page_id);
         /* Still send ACK even if page not found */
         return send_invalidate_ack(msg->header.sender, page_id);
     }
@@ -226,15 +280,16 @@ int handle_invalidate(const message_t *msg) {
     }
 
     /* Acquire page table lock before modifying entry state/owner */
-    pthread_mutex_lock(&ctx->page_table->lock);
+    pthread_mutex_lock(&owning_table->lock);
     entry->state = PAGE_STATE_INVALID;
     entry->owner = new_owner;
-    pthread_mutex_unlock(&ctx->page_table->lock);
+    pthread_mutex_unlock(&owning_table->lock);
 
     LOG_DEBUG("Invalidated page %lu (state=INVALID, new_owner=%u)",
               page_id, new_owner);
 
     /* Send ACK */
+    page_table_release(owning_table);
     return send_invalidate_ack(msg->header.sender, page_id);
 }
 

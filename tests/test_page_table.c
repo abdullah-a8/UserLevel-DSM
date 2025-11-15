@@ -35,7 +35,7 @@ int test_create_destroy(void) {
         return 0;
     }
 
-    page_table_t *table = page_table_create(base, TEST_SIZE);
+    page_table_t *table = page_table_create(base, TEST_SIZE, 0, 0);
     if (!table) {
         munmap(base, TEST_SIZE);
         return 0;
@@ -59,7 +59,7 @@ int test_lookup_by_addr(void) {
         return 0;
     }
 
-    page_table_t *table = page_table_create(base, TEST_SIZE);
+    page_table_t *table = page_table_create(base, TEST_SIZE, 0, 0);
     if (!table) {
         munmap(base, TEST_SIZE);
         return 0;
@@ -103,7 +103,7 @@ int test_lookup_by_id(void) {
         return 0;
     }
 
-    page_table_t *table = page_table_create(base, TEST_SIZE);
+    page_table_t *table = page_table_create(base, TEST_SIZE, 0, 0);
     if (!table) {
         munmap(base, TEST_SIZE);
         return 0;
@@ -139,7 +139,7 @@ int test_set_owner(void) {
         return 0;
     }
 
-    page_table_t *table = page_table_create(base, TEST_SIZE);
+    page_table_t *table = page_table_create(base, TEST_SIZE, 0, 0);
     if (!table) {
         munmap(base, TEST_SIZE);
         return 0;
@@ -173,7 +173,7 @@ int test_set_state(void) {
         return 0;
     }
 
-    page_table_t *table = page_table_create(base, TEST_SIZE);
+    page_table_t *table = page_table_create(base, TEST_SIZE, 0, 0);
     if (!table) {
         munmap(base, TEST_SIZE);
         return 0;

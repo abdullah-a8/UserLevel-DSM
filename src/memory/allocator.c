@@ -50,7 +50,7 @@ void* dsm_malloc(size_t size) {
         return NULL;
     }
 
-    page_table_t *new_table = page_table_create(addr, aligned_size);
+    page_table_t *new_table = page_table_create(addr, aligned_size, ctx->node_id, ctx->num_allocations);
     if (!new_table) {
         pthread_mutex_unlock(&ctx->lock);
         munmap(addr, aligned_size);
@@ -67,8 +67,17 @@ void* dsm_malloc(size_t size) {
         ctx->page_table = new_table;
 
         /* Initialize consistency module now that first page table exists */
-        /* Note: We initialize with a reasonable max size (1000 pages) */
-        int rc = consistency_init(1000);
+        /* Note: We use a hash table with 100K buckets for the page directory.
+         * This provides good performance while using minimal memory (~8 MB for buckets).
+         * Entries are created on-demand when pages are accessed, so actual memory usage
+         * depends on the number of pages in use, not the maximum possible page ID.
+         *
+         * Memory usage: 100K buckets * 8 bytes/pointer = 800 KB
+         * Plus: ~128 bytes per actual page entry (allocated on demand)
+         * Example: 10K pages in use = 800 KB + 10K * 128 bytes = ~2 MB total
+         *
+         * This is a huge improvement over the previous 1.9 GB fixed allocation! */
+        int rc = consistency_init(100000);
         if (rc != DSM_SUCCESS && rc != DSM_ERROR_INIT) {
             LOG_ERROR("Failed to initialize consistency module");
             page_table_destroy(new_table);
@@ -87,13 +96,8 @@ void* dsm_malloc(size_t size) {
         for (size_t i = 0; i < num_pages; i++) {
             page_id_t global_page_id = new_table->entries[i].id;
 
-            /* Make sure page ID is within directory bounds */
-            if (global_page_id < dir->num_entries) {
-                /* Acquire per-entry lock for directory */
-                pthread_mutex_lock(&dir->entries[global_page_id].lock);
-                dir->entries[global_page_id].owner = ctx->node_id;
-                pthread_mutex_unlock(&dir->entries[global_page_id].lock);
-            }
+            /* Set owner in directory using hash table API */
+            directory_set_owner(dir, global_page_id, ctx->node_id);
 
             /* Set owner in page table (ctx->lock already held) */
             new_table->entries[i].owner = ctx->node_id;
@@ -140,10 +144,7 @@ int dsm_free(void *ptr) {
 
     size_t size = target_table->total_size;
 
-    /* Destroy page table */
-    page_table_destroy(target_table);
-
-    /* Remove from list and compact */
+    /* Remove from list and compact - this prevents new references from being acquired */
     for (int i = target_index; i < ctx->num_allocations - 1; i++) {
         ctx->page_tables[i] = ctx->page_tables[i + 1];
     }
@@ -158,6 +159,10 @@ int dsm_free(void *ptr) {
     }
 
     pthread_mutex_unlock(&ctx->lock);
+
+    /* Release the owner's reference - table will be destroyed when refcount reaches 0
+     * If handlers are currently using the table, it will be destroyed when they release */
+    page_table_release(target_table);
 
     /* Unmap memory */
     if (munmap(ptr, size) != 0) {

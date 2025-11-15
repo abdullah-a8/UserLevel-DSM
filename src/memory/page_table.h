@@ -50,8 +50,10 @@ typedef struct {
     void *base_addr;           /**< Base virtual address of DSM region */
     size_t total_size;         /**< Total size in bytes */
     size_t num_pages;          /**< Number of pages */
+    page_id_t start_page_id;   /**< First global page ID for this table */
     page_entry_t *entries;     /**< Array of page entries */
     pthread_mutex_t lock;      /**< Mutex for thread-safe access */
+    int refcount;              /**< Reference count to prevent premature destruction */
 } page_table_t;
 
 /* ============================ */
@@ -63,9 +65,11 @@ typedef struct {
  *
  * @param base_addr Base address of DSM region
  * @param size Total size of region in bytes
+ * @param node_id Node ID for globally unique page ID assignment
+ * @param allocation_index Index of this allocation (0-31) for unique page ID assignment
  * @return Pointer to page table, or NULL on failure
  */
-page_table_t* page_table_create(void *base_addr, size_t size);
+page_table_t* page_table_create(void *base_addr, size_t size, node_id_t node_id, int allocation_index);
 
 /**
  * Destroy a page table
@@ -73,6 +77,22 @@ page_table_t* page_table_create(void *base_addr, size_t size);
  * @param table Page table to destroy
  */
 void page_table_destroy(page_table_t *table);
+
+/**
+ * Acquire a reference to a page table (increment refcount)
+ * Must be called while holding ctx->lock to ensure the table isn't being freed
+ *
+ * @param table Page table to acquire reference to
+ */
+void page_table_acquire(page_table_t *table);
+
+/**
+ * Release a reference to a page table (decrement refcount)
+ * Will destroy the table if refcount reaches zero
+ *
+ * @param table Page table to release reference from
+ */
+void page_table_release(page_table_t *table);
 
 /**
  * Look up page entry by virtual address

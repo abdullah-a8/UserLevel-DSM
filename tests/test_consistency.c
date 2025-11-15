@@ -18,7 +18,8 @@ void test_directory_create(void) {
 
     page_directory_t *dir = directory_create(NUM_TEST_PAGES);
     assert(dir != NULL);
-    assert(dir->num_entries == NUM_TEST_PAGES);
+    assert(dir->table_size == NUM_TEST_PAGES);
+    assert(dir->num_entries == 0);  /* Hash table starts empty */
 
     directory_destroy(dir);
     printf("  ✓ directory_create passed\n");

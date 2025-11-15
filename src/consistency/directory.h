@@ -25,23 +25,25 @@ typedef struct {
 } sharer_list_t;
 
 /**
- * Directory entry for one page
+ * Directory entry for one page (hash table node with chaining)
  */
-typedef struct {
+typedef struct directory_entry_s {
     page_id_t page_id;
     node_id_t owner;           /**< Current owner (has write access) */
     sharer_list_t sharers;     /**< Nodes with read-only copies */
     bool is_valid;             /**< True if entry is in use */
     pthread_mutex_t lock;      /**< Per-entry lock */
+    struct directory_entry_s *next;  /**< Next entry in hash chain */
 } directory_entry_t;
 
 /**
- * Page directory structure
+ * Page directory structure (hash table implementation)
  */
 typedef struct page_directory_s {
-    directory_entry_t *entries;
-    size_t num_entries;
-    pthread_mutex_t lock;      /**< Global directory lock */
+    directory_entry_t **buckets;    /**< Hash table buckets (array of linked lists) */
+    size_t table_size;              /**< Number of hash buckets */
+    size_t num_entries;             /**< Number of pages currently tracked */
+    pthread_mutex_t lock;           /**< Global directory lock */
 } page_directory_t;
 
 /**
@@ -113,5 +115,15 @@ int directory_remove_sharer(page_directory_t *dir, page_id_t page_id, node_id_t 
  */
 int directory_get_sharers(page_directory_t *dir, page_id_t page_id,
                           node_id_t *sharers, int *count);
+
+/**
+ * Set the owner of a page (used during allocation)
+ *
+ * @param dir Page directory
+ * @param page_id Page identifier
+ * @param owner New owner node ID
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owner);
 
 #endif /* DIRECTORY_H */
