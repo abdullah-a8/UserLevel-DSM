@@ -43,7 +43,9 @@ page_table_t* page_table_create(void *base_addr, size_t size) {
         table->entries[i].version = 0;
         table->entries[i].is_allocated = true;
         table->entries[i].request_pending = false;
+        table->entries[i].num_waiting_threads = 0;
         pthread_cond_init(&table->entries[i].ready_cv, NULL);
+        pthread_mutex_init(&table->entries[i].entry_lock, NULL);
     }
 
     LOG_INFO("Page table created: base=%p, size=%zu, pages=%zu",
@@ -59,6 +61,7 @@ void page_table_destroy(page_table_t *table) {
     if (table->entries) {
         for (size_t i = 0; i < table->num_pages; i++) {
             pthread_cond_destroy(&table->entries[i].ready_cv);
+            pthread_mutex_destroy(&table->entries[i].entry_lock);
         }
         free(table->entries);
     }

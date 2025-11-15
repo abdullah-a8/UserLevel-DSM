@@ -7,6 +7,7 @@
 #include "directory.h"
 #include "../core/log.h"
 #include "../core/dsm_context.h"
+#include "../core/perf_log.h"
 #include "../memory/page_table.h"
 #include "../memory/permission.h"
 #include "../network/handlers.h"
@@ -79,37 +80,73 @@ int fetch_page_read(page_id_t page_id) {
         return DSM_SUCCESS;
     }
 
-    /* Mark request as pending */
-    pthread_mutex_lock(&ctx->page_table->lock);
+    /* Task 8.1: Request queuing to prevent thundering herd */
+    pthread_mutex_lock(&entry->entry_lock);
+
+    /* Check if another thread is already fetching this page */
+    if (entry->request_pending) {
+        /* Queue this request by incrementing waiting counter */
+        entry->num_waiting_threads++;
+        LOG_DEBUG("Page %lu fetch already in progress, queuing request (waiters=%d)",
+                  page_id, entry->num_waiting_threads);
+
+        /* Wait for the page to arrive (with timeout) */
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 5;  /* 5 second timeout */
+
+        while (entry->request_pending) {
+            rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
+            if (rc != 0) {
+                LOG_ERROR("Timeout waiting for page %lu", page_id);
+                entry->num_waiting_threads--;
+                pthread_mutex_unlock(&entry->entry_lock);
+                perf_log_timeout();  /* Task 8.6 */
+                return DSM_ERROR_TIMEOUT;
+            }
+        }
+
+        entry->num_waiting_threads--;
+        pthread_mutex_unlock(&entry->entry_lock);
+
+        /* Page should now be available */
+        LOG_DEBUG("Page %lu now available after queued wait", page_id);
+        return DSM_SUCCESS;
+    }
+
+    /* This thread will fetch the page */
     entry->request_pending = true;
-    pthread_mutex_unlock(&ctx->page_table->lock);
+    pthread_mutex_unlock(&entry->entry_lock);
 
     /* Send PAGE_REQUEST with READ access */
     rc = send_page_request(owner, page_id, ACCESS_READ);
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to send PAGE_REQUEST to node %u", owner);
-        pthread_mutex_lock(&ctx->page_table->lock);
+        pthread_mutex_lock(&entry->entry_lock);
         entry->request_pending = false;
-        pthread_mutex_unlock(&ctx->page_table->lock);
+        pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters */
+        pthread_mutex_unlock(&entry->entry_lock);
         return rc;
     }
 
     /* Wait for PAGE_REPLY (with timeout) */
-    pthread_mutex_lock(&ctx->page_table->lock);
+    pthread_mutex_lock(&entry->entry_lock);
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 5;  /* 5 second timeout */
+    timeout.tv_sec += 5;  /* 5 second timeout (Task 8.2) */
 
     while (entry->request_pending) {
-        rc = pthread_cond_timedwait(&entry->ready_cv, &ctx->page_table->lock, &timeout);
+        rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
         if (rc != 0) {
             LOG_ERROR("Timeout waiting for page %lu", page_id);
             entry->request_pending = false;
-            pthread_mutex_unlock(&ctx->page_table->lock);
+            pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters */
+            pthread_mutex_unlock(&entry->entry_lock);
+            perf_log_timeout();  /* Task 8.6 */
             return DSM_ERROR_TIMEOUT;
         }
     }
-    pthread_mutex_unlock(&ctx->page_table->lock);
+    pthread_mutex_unlock(&entry->entry_lock);
 
     /* Update directory: add self as sharer */
     directory_add_reader(g_directory, page_id, ctx->node_id);
@@ -150,6 +187,44 @@ int fetch_page_write(page_id_t page_id) {
 
     LOG_DEBUG("Fetching page %lu for write from node %u", page_id, owner);
 
+    /* Task 8.1: Request queuing for write requests */
+    pthread_mutex_lock(&entry->entry_lock);
+
+    /* Check if another thread is already fetching this page for write */
+    if (entry->request_pending) {
+        /* Queue this request by incrementing waiting counter */
+        entry->num_waiting_threads++;
+        LOG_DEBUG("Page %lu write fetch already in progress, queuing request (waiters=%d)",
+                  page_id, entry->num_waiting_threads);
+
+        /* Wait for the page to arrive (with timeout) */
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 10;  /* 10 second timeout for writes (longer than reads) */
+
+        while (entry->request_pending) {
+            rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
+            if (rc != 0) {
+                LOG_ERROR("Timeout waiting for page %lu (write)", page_id);
+                entry->num_waiting_threads--;
+                pthread_mutex_unlock(&entry->entry_lock);
+                perf_log_timeout();  /* Task 8.6 */
+                return DSM_ERROR_TIMEOUT;
+            }
+        }
+
+        entry->num_waiting_threads--;
+        pthread_mutex_unlock(&entry->entry_lock);
+
+        /* Page should now be available */
+        LOG_DEBUG("Page %lu now available after queued write wait", page_id);
+        return DSM_SUCCESS;
+    }
+
+    /* This thread will fetch the page */
+    entry->request_pending = true;
+    pthread_mutex_unlock(&entry->entry_lock);
+
     /* Get list of nodes to invalidate */
     node_id_t invalidate_list[MAX_SHARERS];
     int num_invalidate = 0;
@@ -157,6 +232,10 @@ int fetch_page_write(page_id_t page_id) {
                               invalidate_list, &num_invalidate);
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to update directory for page %lu", page_id);
+        pthread_mutex_lock(&entry->entry_lock);
+        entry->request_pending = false;
+        pthread_cond_broadcast(&entry->ready_cv);
+        pthread_mutex_unlock(&entry->entry_lock);
         return rc;
     }
 
@@ -184,37 +263,35 @@ int fetch_page_write(page_id_t page_id) {
 
     /* If we were not the owner, request page data */
     if (owner != ctx->node_id) {
-        /* Mark request as pending */
-        pthread_mutex_lock(&ctx->page_table->lock);
-        entry->request_pending = true;
-        pthread_mutex_unlock(&ctx->page_table->lock);
-
         /* Send PAGE_REQUEST with WRITE access */
         rc = send_page_request(owner, page_id, ACCESS_WRITE);
         if (rc != DSM_SUCCESS) {
             LOG_ERROR("Failed to send PAGE_REQUEST to node %u", owner);
-            pthread_mutex_lock(&ctx->page_table->lock);
+            pthread_mutex_lock(&entry->entry_lock);
             entry->request_pending = false;
-            pthread_mutex_unlock(&ctx->page_table->lock);
+            pthread_cond_broadcast(&entry->ready_cv);
+            pthread_mutex_unlock(&entry->entry_lock);
             return rc;
         }
 
         /* Wait for PAGE_REPLY (with timeout) */
-        pthread_mutex_lock(&ctx->page_table->lock);
+        pthread_mutex_lock(&entry->entry_lock);
         struct timespec timeout;
         clock_gettime(CLOCK_REALTIME, &timeout);
-        timeout.tv_sec += 5;  /* 5 second timeout */
+        timeout.tv_sec += 10;  /* 10 second timeout (Task 8.2) */
 
         while (entry->request_pending) {
-            rc = pthread_cond_timedwait(&entry->ready_cv, &ctx->page_table->lock, &timeout);
+            rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
             if (rc != 0) {
                 LOG_ERROR("Timeout waiting for page %lu", page_id);
                 entry->request_pending = false;
-                pthread_mutex_unlock(&ctx->page_table->lock);
+                pthread_cond_broadcast(&entry->ready_cv);
+                pthread_mutex_unlock(&entry->entry_lock);
+                perf_log_timeout();  /* Task 8.6 */
                 return DSM_ERROR_TIMEOUT;
             }
         }
-        pthread_mutex_unlock(&ctx->page_table->lock);
+        pthread_mutex_unlock(&entry->entry_lock);
 
         /* Update stats */
         pthread_mutex_lock(&ctx->stats_lock);
@@ -224,8 +301,18 @@ int fetch_page_write(page_id_t page_id) {
         /* We already own it, just upgrade permission */
         rc = set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
         if (rc != DSM_SUCCESS) {
+            pthread_mutex_lock(&entry->entry_lock);
+            entry->request_pending = false;
+            pthread_cond_broadcast(&entry->ready_cv);
+            pthread_mutex_unlock(&entry->entry_lock);
             return rc;
         }
+
+        /* Clear request pending flag */
+        pthread_mutex_lock(&entry->entry_lock);
+        entry->request_pending = false;
+        pthread_cond_broadcast(&entry->ready_cv);
+        pthread_mutex_unlock(&entry->entry_lock);
     }
 
     /* Update local state */

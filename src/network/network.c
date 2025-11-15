@@ -7,6 +7,7 @@
 #include "handlers.h"
 #include "../core/log.h"
 #include "../core/dsm_context.h"
+#include "../core/perf_log.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -252,15 +253,73 @@ int network_send(node_id_t dest, const message_t *msg) {
         return DSM_ERROR_INVALID;
     }
 
-    /* Send */
-    ssize_t sent = send(sockfd, buffer, len, 0);
-    if (sent < 0) {
-        LOG_ERROR("Send to node %u failed: %s", dest, strerror(errno));
-        return DSM_ERROR_NETWORK;
+    /* Task 8.4: Network failure handling with retries */
+    const int MAX_RETRIES = 3;
+    const int RETRY_DELAY_MS = 100;  /* 100ms delay between retries */
+    int retry_count = 0;
+
+    while (retry_count < MAX_RETRIES) {
+        /* Send with full data transmission */
+        size_t total_sent = 0;
+        while (total_sent < len) {
+            ssize_t sent = send(sockfd, buffer + total_sent, len - total_sent, MSG_NOSIGNAL);
+
+            if (sent < 0) {
+                /* Handle different error types */
+                if (errno == EINTR) {
+                    /* Interrupted by signal, retry immediately */
+                    continue;
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* Would block, wait and retry */
+                    struct timespec wait = {0, RETRY_DELAY_MS * 1000000};
+                    nanosleep(&wait, NULL);
+                    continue;
+                } else if (errno == EPIPE || errno == ECONNRESET) {
+                    /* Connection broken, mark as disconnected */
+                    LOG_ERROR("Connection to node %u broken: %s", dest, strerror(errno));
+                    pthread_mutex_lock(&ctx->lock);
+                    ctx->network.nodes[dest].connected = false;
+                    pthread_mutex_unlock(&ctx->lock);
+                    return DSM_ERROR_NETWORK;
+                } else {
+                    /* Other error, retry */
+                    LOG_WARN("Send to node %u failed (attempt %d/%d): %s",
+                             dest, retry_count + 1, MAX_RETRIES, strerror(errno));
+                    break;  /* Exit inner loop to retry */
+                }
+            } else if (sent == 0) {
+                /* Connection closed */
+                LOG_ERROR("Connection to node %u closed", dest);
+                pthread_mutex_lock(&ctx->lock);
+                ctx->network.nodes[dest].connected = false;
+                pthread_mutex_unlock(&ctx->lock);
+                return DSM_ERROR_NETWORK;
+            } else {
+                /* Successful send */
+                total_sent += sent;
+            }
+        }
+
+        /* Check if we sent all data successfully */
+        if (total_sent == len) {
+            LOG_DEBUG("Sent message type=%d to node %u (%zu bytes)", msg->header.type, dest, len);
+            return DSM_SUCCESS;
+        }
+
+        /* Retry after delay */
+        retry_count++;
+        if (retry_count < MAX_RETRIES) {
+            /* Track retry in performance stats (Task 8.6) */
+            perf_log_network_retry();
+            struct timespec wait = {0, RETRY_DELAY_MS * 1000000 * retry_count};
+            nanosleep(&wait, NULL);
+        }
     }
 
-    LOG_DEBUG("Sent message type=%d to node %u (%zd bytes)", msg->header.type, dest, sent);
-    return DSM_SUCCESS;
+    /* All retries exhausted (Task 8.6) */
+    LOG_ERROR("Failed to send message to node %u after %d retries", dest, MAX_RETRIES);
+    perf_log_network_failure();
+    return DSM_ERROR_NETWORK;
 }
 
 int network_recv(int sockfd, message_t *msg) {

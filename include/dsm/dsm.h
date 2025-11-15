@@ -189,6 +189,36 @@ void dsm_print_stats(void);
  */
 void dsm_set_log_level(int level);
 
+/* ============================ */
+/*     Performance Logging      */
+/* ============================ */
+
+/**
+ * Initialize performance logging (Task 8.6)
+ *
+ * Enables detailed performance tracking and CSV logging.
+ *
+ * @param log_file Path to CSV log file (NULL to disable file logging)
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int dsm_perf_log_init(const char *log_file);
+
+/**
+ * Export statistics to CSV file (Task 8.6)
+ *
+ * Exports all performance metrics to a CSV file for analysis.
+ *
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int dsm_perf_export_stats(void);
+
+/**
+ * Print performance summary (Task 8.6)
+ *
+ * Prints a detailed performance summary to console.
+ */
+void dsm_perf_print_summary(void);
+
 #ifdef __cplusplus
 }
 #endif

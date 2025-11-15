@@ -150,11 +150,16 @@ int handle_page_reply(const message_t *msg) {
 
     LOG_DEBUG("Copied page %lu data and updated permissions", page_id);
 
-    /* Signal waiting threads */
-    pthread_mutex_lock(&ctx->page_table->lock);
+    /* Signal waiting threads (Task 8.1: wake all queued requesters) */
+    pthread_mutex_lock(&entry->entry_lock);
+    int waiters = entry->num_waiting_threads;
     entry->request_pending = false;
-    pthread_cond_broadcast(&entry->ready_cv);
-    pthread_mutex_unlock(&ctx->page_table->lock);
+    pthread_cond_broadcast(&entry->ready_cv);  /* Wake ALL waiting threads */
+    pthread_mutex_unlock(&entry->entry_lock);
+
+    if (waiters > 0) {
+        LOG_DEBUG("Woke %d waiting threads for page %lu", waiters, page_id);
+    }
 
     return DSM_SUCCESS;
 }

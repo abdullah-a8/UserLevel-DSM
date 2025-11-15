@@ -139,7 +139,7 @@ typedef struct {
 /* ============================ */
 
 /**
- * DSM runtime statistics
+ * DSM runtime statistics (Task 8.6: Performance logging)
  */
 typedef struct {
     uint64_t page_faults;            /**< Total page faults */
@@ -153,6 +153,16 @@ typedef struct {
     uint64_t network_bytes_received; /**< Total bytes received */
     uint64_t lock_acquires;          /**< Lock acquisitions */
     uint64_t barrier_waits;          /**< Barrier synchronizations */
+
+    /* Performance metrics (Task 8.6) */
+    uint64_t total_fault_latency_ns; /**< Total fault handling time (nanoseconds) */
+    uint64_t max_fault_latency_ns;   /**< Maximum fault latency */
+    uint64_t min_fault_latency_ns;   /**< Minimum fault latency */
+    uint64_t queued_requests;        /**< Number of queued page requests */
+    uint64_t false_sharing_events;   /**< Potential false sharing detections */
+    uint64_t network_retries;        /**< Network send retries */
+    uint64_t network_failures;       /**< Network failures after retries */
+    uint64_t timeouts;               /**< Request timeouts */
 } dsm_stats_t;
 
 #endif /* DSM_TYPES_H */

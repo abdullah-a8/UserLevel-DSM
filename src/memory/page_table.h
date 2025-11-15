@@ -29,9 +29,11 @@ typedef struct {
     uint64_t version;          /**< Version number for consistency */
     bool is_allocated;         /**< True if entry is in use */
 
-    /* For request queuing */
+    /* For request queuing (Task 8.1) */
     bool request_pending;      /**< True if page transfer in progress */
+    int num_waiting_threads;   /**< Number of threads waiting for this page */
     pthread_cond_t ready_cv;   /**< Condition variable for waiting threads */
+    pthread_mutex_t entry_lock;/**< Per-entry lock for finer-grained locking */
 } page_entry_t;
 
 /* ============================ */

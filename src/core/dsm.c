@@ -6,6 +6,7 @@
 #include "dsm/dsm.h"
 #include "dsm_context.h"
 #include "log.h"
+#include "perf_log.h"
 #include "../memory/fault_handler.h"
 #include "../consistency/page_migration.h"
 #include <stdlib.h>
@@ -46,6 +47,7 @@ int dsm_finalize(void) {
     LOG_INFO("Finalizing DSM");
     consistency_cleanup();
     uninstall_fault_handler();
+    perf_log_cleanup();  /* Clean up performance logging resources */
     dsm_context_cleanup();
     LOG_INFO("DSM finalized");
     return DSM_SUCCESS;
@@ -102,4 +104,17 @@ void dsm_print_stats(void) {
 
 void dsm_set_log_level(int level) {
     log_set_level((log_level_t)level);
+}
+
+/* Performance logging (Task 8.6) */
+int dsm_perf_log_init(const char *log_file) {
+    return perf_log_init(log_file);
+}
+
+int dsm_perf_export_stats(void) {
+    return perf_log_export_stats();
+}
+
+void dsm_perf_print_summary(void) {
+    perf_log_print_summary();
 }
