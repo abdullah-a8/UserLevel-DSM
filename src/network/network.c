@@ -201,9 +201,44 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             memcpy(buffer + offset, &msg->payload.invalidate_ack, sizeof(invalidate_ack_payload_t));
             offset += sizeof(invalidate_ack_payload_t);
             break;
+        case MSG_LOCK_REQUEST:
+            memcpy(buffer + offset, &msg->payload.lock_request, sizeof(lock_request_payload_t));
+            offset += sizeof(lock_request_payload_t);
+            break;
+        case MSG_LOCK_GRANT:
+            memcpy(buffer + offset, &msg->payload.lock_grant, sizeof(lock_grant_payload_t));
+            offset += sizeof(lock_grant_payload_t);
+            break;
+        case MSG_LOCK_RELEASE:
+            memcpy(buffer + offset, &msg->payload.lock_release, sizeof(lock_release_payload_t));
+            offset += sizeof(lock_release_payload_t);
+            break;
+        case MSG_BARRIER_ARRIVE:
+            memcpy(buffer + offset, &msg->payload.barrier_arrive, sizeof(barrier_arrive_payload_t));
+            offset += sizeof(barrier_arrive_payload_t);
+            break;
+        case MSG_BARRIER_RELEASE:
+            memcpy(buffer + offset, &msg->payload.barrier_release, sizeof(barrier_release_payload_t));
+            offset += sizeof(barrier_release_payload_t);
+            break;
+        case MSG_NODE_JOIN:
+            memcpy(buffer + offset, &msg->payload.node_join, sizeof(node_join_payload_t));
+            offset += sizeof(node_join_payload_t);
+            break;
+        case MSG_NODE_LEAVE:
+            memcpy(buffer + offset, &msg->payload.node_leave, sizeof(node_leave_payload_t));
+            offset += sizeof(node_leave_payload_t);
+            break;
+        case MSG_HEARTBEAT:
+            /* Heartbeat has no payload */
+            break;
+        case MSG_ERROR:
+            memcpy(buffer + offset, &msg->payload.error, sizeof(error_payload_t));
+            offset += sizeof(error_payload_t);
+            break;
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
-            break;
+            return DSM_ERROR_INVALID;
     }
 
     *len = offset;
