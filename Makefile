@@ -44,9 +44,13 @@ DEMO_BIN = $(patsubst $(DEMO_DIR)/%.c,$(BUILD_DIR)/%,$(DEMO_SRC))
 LIB = $(BUILD_DIR)/libdsm.a
 
 # Targets
-.PHONY: all clean test demo help test-tsan test-valgrind test-all
+.PHONY: all clean test demo help test-tsan test-valgrind test-all build-tests
 
 all: $(LIB)
+
+# Build tests without running them (useful for deployment)
+build-tests: $(LIB) $(TEST_BIN)
+	@echo "All test binaries built successfully"
 
 # Build static library
 $(LIB): $(ALL_OBJ) | $(BUILD_DIR)
@@ -179,6 +183,7 @@ help:
 	@echo "======================="
 	@echo "Targets:"
 	@echo "  all          - Build DSM library (default)"
+	@echo "  build-tests  - Build test binaries without running them"
 	@echo "  test         - Build and run all tests"
 	@echo "  test-tsan    - Run tests with ThreadSanitizer (race condition detection)"
 	@echo "  test-valgrind- Run tests with Valgrind (memory leak detection)"
@@ -190,6 +195,7 @@ help:
 	@echo ""
 	@echo "Example usage:"
 	@echo "  make              # Build library"
+	@echo "  make build-tests  # Build test binaries (for deployment)"
 	@echo "  make test         # Build and run tests"
 	@echo "  make test-tsan    # Check for race conditions"
 	@echo "  make test-valgrind# Check for memory leaks"
