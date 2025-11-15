@@ -4,6 +4,7 @@
  */
 
 #include "network.h"
+#include "handlers.h"
 #include "../core/log.h"
 #include "../core/dsm_context.h"
 #include <sys/socket.h>
@@ -320,7 +321,7 @@ static void* dispatcher_thread(void *arg) {
                 message_t msg;
                 if (network_recv(fds[i].fd, &msg) == DSM_SUCCESS) {
                     LOG_DEBUG("Received message type=%d", msg.header.type);
-                    /* Message handling will be added later */
+                    dispatch_message(&msg);
                 }
             }
         }
