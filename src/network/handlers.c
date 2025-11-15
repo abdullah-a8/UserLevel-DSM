@@ -51,7 +51,59 @@ int handle_page_request(const message_t *msg) {
     }
 
     /* Send page data */
-    return send_page_reply(requester, page_id, entry->local_addr);
+    int rc = send_page_reply(requester, page_id, entry->local_addr);
+    if (rc != DSM_SUCCESS) {
+        return rc;
+    }
+
+    /* Update stats */
+    pthread_mutex_lock(&ctx->stats_lock);
+    ctx->stats.pages_sent++;
+    pthread_mutex_unlock(&ctx->stats_lock);
+
+    /* If request is for WRITE access, downgrade our copy */
+    if (access == ACCESS_WRITE) {
+        LOG_DEBUG("Downgrading page %lu to INVALID (transferred to node %u)",
+                  page_id, requester);
+
+        /* Check return value of set_page_permission */
+        rc = set_page_permission(entry->local_addr, PAGE_PERM_NONE);
+        if (rc != DSM_SUCCESS) {
+            LOG_ERROR("Failed to set page %lu permission to NONE", page_id);
+            return rc;
+        }
+
+        /* Acquire page table lock before modifying entry state/owner */
+        pthread_mutex_lock(&ctx->page_table->lock);
+        entry->state = PAGE_STATE_INVALID;
+        entry->owner = requester;
+        pthread_mutex_unlock(&ctx->page_table->lock);
+    } else {
+        /* For READ access, we keep our copy and can also share */
+        LOG_DEBUG("Keeping page %lu as shared (node %u also has read access)",
+                  page_id, requester);
+
+        pthread_mutex_lock(&ctx->page_table->lock);
+        if (entry->state == PAGE_STATE_READ_WRITE) {
+            pthread_mutex_unlock(&ctx->page_table->lock);
+
+            /* Check return value of set_page_permission */
+            rc = set_page_permission(entry->local_addr, PAGE_PERM_READ);
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to set page %lu permission to READ", page_id);
+                return rc;
+            }
+
+            /* Downgrade to READ_ONLY since someone else has a copy */
+            pthread_mutex_lock(&ctx->page_table->lock);
+            entry->state = PAGE_STATE_READ_ONLY;
+            pthread_mutex_unlock(&ctx->page_table->lock);
+        } else {
+            pthread_mutex_unlock(&ctx->page_table->lock);
+        }
+    }
+
+    return DSM_SUCCESS;
 }
 
 /* PAGE_REPLY */
@@ -74,8 +126,9 @@ int send_page_reply(node_id_t requester, page_id_t page_id, const void *data) {
 
 int handle_page_reply(const message_t *msg) {
     page_id_t page_id = msg->payload.page_reply.page_id;
+    uint64_t version = msg->payload.page_reply.version;
 
-    LOG_DEBUG("Handling PAGE_REPLY for page %lu", page_id);
+    LOG_DEBUG("Handling PAGE_REPLY for page %lu (version %lu)", page_id, version);
 
     dsm_context_t *ctx = dsm_get_context();
     if (!ctx->page_table) {
@@ -89,9 +142,13 @@ int handle_page_reply(const message_t *msg) {
 
     /* Copy page data */
     memcpy(entry->local_addr, msg->payload.page_reply.data, PAGE_SIZE);
+    entry->version = version;
 
-    /* Update permission to READ_WRITE */
+    /* Set appropriate permission - will be set by fetch_page_read/write */
+    /* For now, conservatively set to READ_WRITE */
     set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
+
+    LOG_DEBUG("Copied page %lu data and updated permissions", page_id);
 
     /* Signal waiting threads */
     pthread_mutex_lock(&ctx->page_table->lock);
@@ -147,11 +204,30 @@ int handle_invalidate(const message_t *msg) {
 
     page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
     if (!entry) {
-        return DSM_ERROR_NOT_FOUND;
+        LOG_WARN("Page %lu not found, ignoring invalidation", page_id);
+        /* Still send ACK even if page not found */
+        return send_invalidate_ack(msg->header.sender, page_id);
     }
 
+    /* Update stats */
+    pthread_mutex_lock(&ctx->stats_lock);
+    ctx->stats.invalidations_received++;
+    pthread_mutex_unlock(&ctx->stats_lock);
+
     /* Set page to INVALID */
-    set_page_permission(entry->local_addr, PAGE_PERM_NONE);
+    int rc = set_page_permission(entry->local_addr, PAGE_PERM_NONE);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to set page %lu permission to NONE", page_id);
+    }
+
+    /* Acquire page table lock before modifying entry state/owner */
+    pthread_mutex_lock(&ctx->page_table->lock);
+    entry->state = PAGE_STATE_INVALID;
+    entry->owner = new_owner;
+    pthread_mutex_unlock(&ctx->page_table->lock);
+
+    LOG_DEBUG("Invalidated page %lu (state=INVALID, new_owner=%u)",
+              page_id, new_owner);
 
     /* Send ACK */
     return send_invalidate_ack(msg->header.sender, page_id);

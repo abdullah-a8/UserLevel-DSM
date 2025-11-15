@@ -9,6 +9,7 @@
 #include "permission.h"
 #include "../core/log.h"
 #include "../core/dsm_context.h"
+#include "../consistency/page_migration.h"
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -96,12 +97,16 @@ int handle_read_fault(void *addr) {
 
     /* State transition: INVALID -> READ_ONLY */
     if (entry->state == PAGE_STATE_INVALID) {
-        /* For local-only testing, just upgrade permission */
-        int rc = set_page_permission(entry->local_addr, PAGE_PERM_READ);
+        /* Fetch page from remote owner */
+        int rc = fetch_page_read(entry->id);
         if (rc != DSM_SUCCESS) {
+            LOG_ERROR("Failed to fetch page %lu for read", entry->id);
             return rc;
         }
-        LOG_DEBUG("Read fault: page %lu -> READ_ONLY", entry->id);
+        LOG_DEBUG("Read fault: page %lu fetched and set to READ_ONLY", entry->id);
+    } else if (entry->state == PAGE_STATE_READ_ONLY) {
+        /* Already have read access, this shouldn't happen */
+        LOG_WARN("Read fault on page %lu which is already READ_ONLY", entry->id);
     }
 
     return DSM_SUCCESS;
@@ -122,11 +127,18 @@ int handle_write_fault(void *addr) {
      * INVALID -> READ_WRITE
      * READ_ONLY -> READ_WRITE
      */
-    int rc = set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
-    if (rc != DSM_SUCCESS) {
-        return rc;
+    if (entry->state == PAGE_STATE_INVALID || entry->state == PAGE_STATE_READ_ONLY) {
+        /* Fetch page with write access (will invalidate remote copies) */
+        int rc = fetch_page_write(entry->id);
+        if (rc != DSM_SUCCESS) {
+            LOG_ERROR("Failed to fetch page %lu for write", entry->id);
+            return rc;
+        }
+        LOG_DEBUG("Write fault: page %lu fetched and set to READ_WRITE", entry->id);
+    } else if (entry->state == PAGE_STATE_READ_WRITE) {
+        /* Already have write access, this shouldn't happen */
+        LOG_WARN("Write fault on page %lu which is already READ_WRITE", entry->id);
     }
 
-    LOG_DEBUG("Write fault: page %lu -> READ_WRITE", entry->id);
     return DSM_SUCCESS;
 }

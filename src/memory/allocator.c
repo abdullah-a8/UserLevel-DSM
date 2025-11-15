@@ -7,6 +7,8 @@
 #include "../core/dsm_context.h"
 #include "../core/log.h"
 #include "page_table.h"
+#include "../consistency/page_migration.h"
+#include "../consistency/directory.h"
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +50,32 @@ void* dsm_malloc(size_t size) {
             munmap(addr, aligned_size);
             LOG_ERROR("Failed to create page table");
             return NULL;
+        }
+
+        /* Initialize consistency module now that page table exists */
+        int rc = consistency_init(ctx->page_table->num_pages);
+        if (rc != DSM_SUCCESS) {
+            LOG_ERROR("Failed to initialize consistency module");
+            page_table_destroy(ctx->page_table);
+            ctx->page_table = NULL;
+            pthread_mutex_unlock(&ctx->lock);
+            munmap(addr, aligned_size);
+            return NULL;
+        }
+
+        /* Set this node as owner of all allocated pages */
+        struct page_directory_s *dir = get_page_directory();
+        if (dir) {
+            for (size_t i = 0; i < num_pages; i++) {
+                /* Acquire per-entry lock for directory */
+                pthread_mutex_lock(&dir->entries[i].lock);
+                dir->entries[i].owner = ctx->node_id;
+                pthread_mutex_unlock(&dir->entries[i].lock);
+
+                /* Page table lock already held (ctx->lock) but set owner */
+                ctx->page_table->entries[i].owner = ctx->node_id;
+            }
+            LOG_INFO("Set node %u as owner of %zu pages", ctx->node_id, num_pages);
         }
     } else {
         /* For now, only support single allocation */

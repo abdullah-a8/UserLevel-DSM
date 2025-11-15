@@ -7,6 +7,7 @@
 #include "dsm_context.h"
 #include "log.h"
 #include "../memory/fault_handler.h"
+#include "../consistency/page_migration.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -35,12 +36,15 @@ int dsm_init(const dsm_config_t *config) {
         return rc;
     }
 
+    /* Note: consistency module will be initialized when dsm_malloc() creates page table */
+
     LOG_INFO("DSM initialized successfully");
     return DSM_SUCCESS;
 }
 
 int dsm_finalize(void) {
     LOG_INFO("Finalizing DSM");
+    consistency_cleanup();
     uninstall_fault_handler();
     dsm_context_cleanup();
     LOG_INFO("DSM finalized");
