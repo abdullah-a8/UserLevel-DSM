@@ -94,6 +94,16 @@ int test_invalidate_handler() {
 }
 
 int test_message_dispatch() {
+    dsm_config_t config = {
+        .node_id = 0,
+        .port = 15102,
+        .num_nodes = 1,
+        .is_manager = true,
+        .log_level = LOG_LEVEL_ERROR
+    };
+
+    dsm_init(&config);
+
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -104,10 +114,21 @@ int test_message_dispatch() {
 
     int rc = dispatch_message(&msg);
 
+    dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;
 }
 
 int test_lock_handlers() {
+    dsm_config_t config = {
+        .node_id = 0,
+        .port = 15103,
+        .num_nodes = 1,
+        .is_manager = true,
+        .log_level = LOG_LEVEL_ERROR
+    };
+
+    dsm_init(&config);
+
     /* Test LOCK_RELEASE (doesn't send) */
     message_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -118,10 +139,21 @@ int test_lock_handlers() {
 
     int rc = dispatch_message(&msg);
 
+    dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;
 }
 
 int test_barrier_handlers() {
+    dsm_config_t config = {
+        .node_id = 0,
+        .port = 15104,
+        .num_nodes = 1,
+        .is_manager = true,
+        .log_level = LOG_LEVEL_ERROR
+    };
+
+    dsm_init(&config);
+
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -132,6 +164,7 @@ int test_barrier_handlers() {
 
     int rc = dispatch_message(&msg);
 
+    dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;
 }
 

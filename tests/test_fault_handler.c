@@ -117,12 +117,16 @@ int test_multiple_pages(void) {
     return 1;
 }
 
+typedef struct {
+    int *data;
+    int thread_id;
+} thread_arg_t;
+
 void* thread_func(void *arg) {
-    int *data = (int*)arg;
+    thread_arg_t *targ = (thread_arg_t*)arg;
 
     /* Each thread writes to different part of same page */
-    int thread_id = (int)(long)pthread_self() % 4;
-    data[thread_id] = thread_id + 100;
+    targ->data[targ->thread_id] = targ->thread_id + 100;
 
     return NULL;
 }
@@ -146,8 +150,11 @@ int test_multithreaded_faults(void) {
 
     /* Create threads */
     pthread_t threads[4];
+    thread_arg_t thread_args[4];
     for (int i = 0; i < 4; i++) {
-        if (pthread_create(&threads[i], NULL, thread_func, data) != 0) {
+        thread_args[i].data = data;
+        thread_args[i].thread_id = i;
+        if (pthread_create(&threads[i], NULL, thread_func, &thread_args[i]) != 0) {
             dsm_free(data);
             dsm_finalize();
             return 0;

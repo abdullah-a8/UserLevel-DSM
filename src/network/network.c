@@ -77,14 +77,24 @@ static void* accept_thread(void *arg) {
     (void)arg;
     dsm_context_t *ctx = dsm_get_context();
 
-    while (ctx->network.running) {
+    while (1) {
+        /* Check if we should continue running and get server_sockfd (with lock) */
+        pthread_mutex_lock(&ctx->lock);
+        bool should_run = ctx->network.running;
+        int server_fd = ctx->network.server_sockfd;
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (!should_run || server_fd < 0) {
+            break;
+        }
+
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
 
-        int client_fd = accept(ctx->network.server_sockfd,
+        int client_fd = accept(server_fd,
                                (struct sockaddr*)&client_addr, &addr_len);
         if (client_fd < 0) {
-            if (errno == EINTR || !ctx->network.running) {
+            if (errno == EINTR) {
                 break;
             }
             LOG_ERROR("Accept failed: %s", strerror(errno));
@@ -333,7 +343,25 @@ static void* dispatcher_thread(void *arg) {
 void network_shutdown(void) {
     dsm_context_t *ctx = dsm_get_context();
 
+    /* Set running flag and close server socket with lock */
+    pthread_mutex_lock(&ctx->lock);
+    bool was_running = ctx->network.running;
     ctx->network.running = false;
+    int server_fd = ctx->network.server_sockfd;
+    ctx->network.server_sockfd = -1;
+    pthread_t thread = ctx->network.dispatcher_thread;
+    ctx->network.dispatcher_thread = 0;  /* Reset thread handle */
+    pthread_mutex_unlock(&ctx->lock);
+
+    /* Close server socket to wake up accept() */
+    if (server_fd >= 0) {
+        close(server_fd);
+
+        /* Wait for accept thread to finish (only if it was running and thread is valid) */
+        if (was_running && thread != 0) {
+            pthread_join(thread, NULL);
+        }
+    }
 
     /* Close all connections */
     for (int i = 0; i < MAX_NODES; i++) {
@@ -342,11 +370,6 @@ void network_shutdown(void) {
             ctx->network.nodes[i].sockfd = -1;
             ctx->network.nodes[i].connected = false;
         }
-    }
-
-    if (ctx->network.server_sockfd >= 0) {
-        close(ctx->network.server_sockfd);
-        ctx->network.server_sockfd = -1;
     }
 
     LOG_INFO("Network shutdown complete");

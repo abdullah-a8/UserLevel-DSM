@@ -44,6 +44,7 @@ int dsm_context_init(const dsm_config_t *config) {
     ctx->network.server_port = config->port;
     ctx->network.num_nodes = 0;
     ctx->network.running = false;
+    ctx->network.dispatcher_thread = 0;
     ctx->network.send_queue = msg_queue_create();
 
     for (int i = 0; i < MAX_NODES; i++) {
