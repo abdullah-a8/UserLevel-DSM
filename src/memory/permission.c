@@ -31,7 +31,7 @@ int set_page_permission(void *addr, page_perm_t perm) {
     }
 
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx->initialized || !ctx->page_table) {
+    if (!ctx->initialized || ctx->num_allocations == 0) {
         LOG_ERROR("DSM not initialized");
         return DSM_ERROR_INIT;
     }
@@ -48,10 +48,24 @@ int set_page_permission(void *addr, page_perm_t perm) {
         return DSM_ERROR_PERMISSION;
     }
 
+    /* Search all page tables for this address */
+    page_entry_t *entry = NULL;
+    page_table_t *owning_table = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_addr(ctx->page_tables[i], page_base);
+            if (entry) {
+                owning_table = ctx->page_tables[i];
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
     /* Update page table state */
-    page_entry_t *entry = page_table_lookup_by_addr(ctx->page_table, page_base);
-    if (entry) {
-        pthread_mutex_lock(&ctx->page_table->lock);
+    if (entry && owning_table) {
+        pthread_mutex_lock(&owning_table->lock);
 
         switch (perm) {
             case PAGE_PERM_NONE:
@@ -65,7 +79,7 @@ int set_page_permission(void *addr, page_perm_t perm) {
                 break;
         }
 
-        pthread_mutex_unlock(&ctx->page_table->lock);
+        pthread_mutex_unlock(&owning_table->lock);
 
         LOG_DEBUG("Page %p permission set to %d (state=%d)",
                   page_base, perm, entry->state);

@@ -47,15 +47,24 @@ page_directory_t* get_page_directory(void) {
 
 int fetch_page_read(page_id_t page_id) {
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx || !ctx->page_table || !g_directory) {
+    if (!ctx || ctx->num_allocations == 0 || !g_directory) {
         LOG_ERROR("DSM not initialized");
         return DSM_ERROR_INIT;
     }
 
-    /* Look up page entry */
-    page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
+    /* Search all page tables for this page ID */
+    page_entry_t *entry = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
     if (!entry) {
-        LOG_ERROR("Page %lu not found in page table", page_id);
+        LOG_ERROR("Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
 
@@ -165,15 +174,24 @@ int fetch_page_read(page_id_t page_id) {
 
 int fetch_page_write(page_id_t page_id) {
     dsm_context_t *ctx = dsm_get_context();
-    if (!ctx || !ctx->page_table || !g_directory) {
+    if (!ctx || ctx->num_allocations == 0 || !g_directory) {
         LOG_ERROR("DSM not initialized");
         return DSM_ERROR_INIT;
     }
 
-    /* Look up page entry */
-    page_entry_t *entry = page_table_lookup_by_id(ctx->page_table, page_id);
+    /* Search all page tables for this page ID */
+    page_entry_t *entry = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
     if (!entry) {
-        LOG_ERROR("Page %lu not found in page table", page_id);
+        LOG_ERROR("Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
 
