@@ -1,0 +1,352 @@
+/**
+ * @file network.c
+ * @brief Network layer implementation
+ */
+
+#include "network.h"
+#include "../core/log.h"
+#include "../core/dsm_context.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <poll.h>
+
+static void* accept_thread(void *arg);
+static void* dispatcher_thread(void *arg);
+
+int network_server_init(uint16_t port) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Create socket */
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        LOG_ERROR("Failed to create socket: %s", strerror(errno));
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Set SO_REUSEADDR */
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOG_ERROR("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Bind */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("Bind failed: %s", strerror(errno));
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Listen */
+    if (listen(sockfd, 10) < 0) {
+        LOG_ERROR("Listen failed: %s", strerror(errno));
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    ctx->network.server_sockfd = sockfd;
+    ctx->network.server_port = port;
+    ctx->network.running = true;
+
+    /* Start accept thread */
+    if (pthread_create(&ctx->network.dispatcher_thread, NULL, accept_thread, NULL) != 0) {
+        LOG_ERROR("Failed to create accept thread");
+        close(sockfd);
+        return DSM_ERROR_INIT;
+    }
+
+    LOG_INFO("Network server listening on port %u", port);
+    return DSM_SUCCESS;
+}
+
+static void* accept_thread(void *arg) {
+    (void)arg;
+    dsm_context_t *ctx = dsm_get_context();
+
+    while (ctx->network.running) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+
+        int client_fd = accept(ctx->network.server_sockfd,
+                               (struct sockaddr*)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            if (errno == EINTR || !ctx->network.running) {
+                break;
+            }
+            LOG_ERROR("Accept failed: %s", strerror(errno));
+            continue;
+        }
+
+        LOG_INFO("Accepted connection from %s:%d",
+                 inet_ntoa(client_addr.sin_addr),
+                 ntohs(client_addr.sin_port));
+
+        /* Store connection (simplified - store in first available slot) */
+        pthread_mutex_lock(&ctx->lock);
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (!ctx->network.nodes[i].connected) {
+                ctx->network.nodes[i].sockfd = client_fd;
+                ctx->network.nodes[i].connected = true;
+                ctx->network.nodes[i].id = i;
+                ctx->network.num_nodes++;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&ctx->lock);
+    }
+
+    return NULL;
+}
+
+int network_connect_to_node(node_id_t node_id, const char *hostname, uint16_t port) {
+    if (!hostname || node_id >= MAX_NODES) {
+        return DSM_ERROR_INVALID;
+    }
+
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Create socket */
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        LOG_ERROR("Socket creation failed: %s", strerror(errno));
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Resolve hostname */
+    struct hostent *host = gethostbyname(hostname);
+    if (!host) {
+        LOG_ERROR("Cannot resolve hostname: %s", hostname);
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Connect */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    memcpy(&addr.sin_addr, host->h_addr_list[0], host->h_length);
+    addr.sin_port = htons(port);
+
+    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("Connect to %s:%u failed: %s", hostname, port, strerror(errno));
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Store connection */
+    pthread_mutex_lock(&ctx->lock);
+    ctx->network.nodes[node_id].sockfd = sockfd;
+    ctx->network.nodes[node_id].connected = true;
+    ctx->network.nodes[node_id].id = node_id;
+    ctx->network.nodes[node_id].port = port;
+    strncpy(ctx->network.nodes[node_id].hostname, hostname, MAX_HOSTNAME_LEN - 1);
+    pthread_mutex_unlock(&ctx->lock);
+
+    LOG_INFO("Connected to node %u at %s:%u", node_id, hostname, port);
+    return DSM_SUCCESS;
+}
+
+int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
+    if (!msg || !buffer || !len) {
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Simple serialization: copy header + payload */
+    size_t offset = 0;
+
+    /* Header */
+    memcpy(buffer + offset, &msg->header, sizeof(msg_header_t));
+    offset += sizeof(msg_header_t);
+
+    /* Payload based on type */
+    switch (msg->header.type) {
+        case MSG_PAGE_REQUEST:
+            memcpy(buffer + offset, &msg->payload.page_request, sizeof(page_request_payload_t));
+            offset += sizeof(page_request_payload_t);
+            break;
+        case MSG_PAGE_REPLY:
+            memcpy(buffer + offset, &msg->payload.page_reply, sizeof(page_reply_payload_t));
+            offset += sizeof(page_reply_payload_t);
+            break;
+        case MSG_INVALIDATE:
+            memcpy(buffer + offset, &msg->payload.invalidate, sizeof(invalidate_payload_t));
+            offset += sizeof(invalidate_payload_t);
+            break;
+        case MSG_INVALIDATE_ACK:
+            memcpy(buffer + offset, &msg->payload.invalidate_ack, sizeof(invalidate_ack_payload_t));
+            offset += sizeof(invalidate_ack_payload_t);
+            break;
+        default:
+            LOG_WARN("Unknown message type: %d", msg->header.type);
+            break;
+    }
+
+    *len = offset;
+    return DSM_SUCCESS;
+}
+
+int deserialize_message(const uint8_t *buffer, size_t len, message_t *msg) {
+    if (!buffer || !msg || len < sizeof(msg_header_t)) {
+        return DSM_ERROR_INVALID;
+    }
+
+    size_t offset = 0;
+
+    /* Header */
+    memcpy(&msg->header, buffer + offset, sizeof(msg_header_t));
+    offset += sizeof(msg_header_t);
+
+    /* Payload */
+    size_t remaining = len - offset;
+    if (remaining > 0) {
+        memcpy(&msg->payload.raw, buffer + offset, remaining);
+    }
+
+    return DSM_SUCCESS;
+}
+
+int network_send(node_id_t dest, const message_t *msg) {
+    if (!msg || dest >= MAX_NODES) {
+        return DSM_ERROR_INVALID;
+    }
+
+    dsm_context_t *ctx = dsm_get_context();
+
+    pthread_mutex_lock(&ctx->lock);
+    if (!ctx->network.nodes[dest].connected) {
+        pthread_mutex_unlock(&ctx->lock);
+        LOG_ERROR("Node %u not connected", dest);
+        return DSM_ERROR_NETWORK;
+    }
+    int sockfd = ctx->network.nodes[dest].sockfd;
+    pthread_mutex_unlock(&ctx->lock);
+
+    /* Serialize */
+    uint8_t buffer[8192];
+    size_t len;
+    if (serialize_message(msg, buffer, &len) != DSM_SUCCESS) {
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Send */
+    ssize_t sent = send(sockfd, buffer, len, 0);
+    if (sent < 0) {
+        LOG_ERROR("Send to node %u failed: %s", dest, strerror(errno));
+        return DSM_ERROR_NETWORK;
+    }
+
+    LOG_DEBUG("Sent message type=%d to node %u (%zd bytes)", msg->header.type, dest, sent);
+    return DSM_SUCCESS;
+}
+
+int network_recv(int sockfd, message_t *msg) {
+    if (sockfd < 0 || !msg) {
+        return DSM_ERROR_INVALID;
+    }
+
+    uint8_t buffer[8192];
+    ssize_t received = recv(sockfd, buffer, sizeof(buffer), 0);
+    if (received <= 0) {
+        if (received == 0) {
+            LOG_INFO("Connection closed");
+        } else {
+            LOG_ERROR("Recv failed: %s", strerror(errno));
+        }
+        return DSM_ERROR_NETWORK;
+    }
+
+    return deserialize_message(buffer, received, msg);
+}
+
+int network_start_dispatcher(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    if (pthread_create(&ctx->network.dispatcher_thread, NULL, dispatcher_thread, NULL) != 0) {
+        LOG_ERROR("Failed to create dispatcher thread");
+        return DSM_ERROR_INIT;
+    }
+
+    LOG_INFO("Network dispatcher started");
+    return DSM_SUCCESS;
+}
+
+static void* dispatcher_thread(void *arg) {
+    (void)arg;
+    dsm_context_t *ctx = dsm_get_context();
+
+    while (ctx->network.running) {
+        struct pollfd fds[MAX_NODES];
+        int nfds = 0;
+
+        pthread_mutex_lock(&ctx->lock);
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (ctx->network.nodes[i].connected) {
+                fds[nfds].fd = ctx->network.nodes[i].sockfd;
+                fds[nfds].events = POLLIN;
+                nfds++;
+            }
+        }
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (nfds == 0) {
+            usleep(100000);
+            continue;
+        }
+
+        int ret = poll(fds, nfds, 1000);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERROR("Poll failed: %s", strerror(errno));
+            break;
+        }
+
+        if (ret == 0) continue;
+
+        for (int i = 0; i < nfds; i++) {
+            if (fds[i].revents & POLLIN) {
+                message_t msg;
+                if (network_recv(fds[i].fd, &msg) == DSM_SUCCESS) {
+                    LOG_DEBUG("Received message type=%d", msg.header.type);
+                    /* Message handling will be added later */
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+void network_shutdown(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    ctx->network.running = false;
+
+    /* Close all connections */
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (ctx->network.nodes[i].sockfd >= 0) {
+            close(ctx->network.nodes[i].sockfd);
+            ctx->network.nodes[i].sockfd = -1;
+            ctx->network.nodes[i].connected = false;
+        }
+    }
+
+    if (ctx->network.server_sockfd >= 0) {
+        close(ctx->network.server_sockfd);
+        ctx->network.server_sockfd = -1;
+    }
+
+    LOG_INFO("Network shutdown complete");
+}
