@@ -6,6 +6,7 @@
 #include "dsm/dsm.h"
 #include "dsm_context.h"
 #include "log.h"
+#include "../memory/fault_handler.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -27,12 +28,20 @@ int dsm_init(const dsm_config_t *config) {
         return rc;
     }
 
+    rc = install_fault_handler();
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to install fault handler");
+        dsm_context_cleanup();
+        return rc;
+    }
+
     LOG_INFO("DSM initialized successfully");
     return DSM_SUCCESS;
 }
 
 int dsm_finalize(void) {
     LOG_INFO("Finalizing DSM");
+    uninstall_fault_handler();
     dsm_context_cleanup();
     LOG_INFO("DSM finalized");
     return DSM_SUCCESS;
