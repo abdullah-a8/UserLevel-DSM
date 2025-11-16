@@ -306,8 +306,13 @@ int dsm_lock_destroy(dsm_lock_t *lock) {
 int lock_manager_grant(lock_id_t lock_id, node_id_t requester) {
     dsm_lock_t *lock = find_lock_by_id(lock_id);
     if (!lock) {
-        LOG_ERROR("Lock %lu not found", lock_id);
-        return DSM_ERROR_NOT_FOUND;
+        /* Lazy creation: create lock if it doesn't exist */
+        LOG_DEBUG("Lock %lu not found on manager, creating lazily", lock_id);
+        lock = dsm_lock_create(lock_id);
+        if (!lock) {
+            LOG_ERROR("Failed to create lock %lu", lock_id);
+            return DSM_ERROR_MEMORY;
+        }
     }
 
     dsm_context_t *ctx = dsm_get_context();
@@ -352,7 +357,8 @@ int lock_manager_grant(lock_id_t lock_id, node_id_t requester) {
 int lock_manager_release(lock_id_t lock_id, node_id_t releaser) {
     dsm_lock_t *lock = find_lock_by_id(lock_id);
     if (!lock) {
-        LOG_ERROR("Lock %lu not found", lock_id);
+        /* This shouldn't happen, but log it */
+        LOG_WARN("Lock %lu not found on release", lock_id);
         return DSM_ERROR_NOT_FOUND;
     }
 

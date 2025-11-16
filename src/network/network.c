@@ -221,6 +221,10 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             memcpy(buffer + offset, &msg->payload.barrier_release, sizeof(barrier_release_payload_t));
             offset += sizeof(barrier_release_payload_t);
             break;
+        case MSG_ALLOC_NOTIFY:
+            memcpy(buffer + offset, &msg->payload.alloc_notify, sizeof(alloc_notify_payload_t));
+            offset += sizeof(alloc_notify_payload_t);
+            break;
         case MSG_NODE_JOIN:
             memcpy(buffer + offset, &msg->payload.node_join, sizeof(node_join_payload_t));
             offset += sizeof(node_join_payload_t);

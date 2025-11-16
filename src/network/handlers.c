@@ -9,6 +9,8 @@
 #include "../core/dsm_context.h"
 #include "../memory/page_table.h"
 #include "../memory/permission.h"
+#include "../consistency/directory.h"
+#include "../consistency/page_migration.h"
 #include <string.h>
 
 /* PAGE_REQUEST */
@@ -435,6 +437,76 @@ int handle_barrier_release(const message_t *msg) {
     return barrier_handle_release(barrier_id);
 }
 
+/* ALLOC_NOTIFY */
+int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t owner, size_t num_pages) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Broadcast to all connected nodes */
+    for (int i = 0; i < MAX_NODES; i++) {
+        pthread_mutex_lock(&ctx->lock);
+        bool connected = ctx->network.nodes[i].connected;
+        node_id_t node_id = ctx->network.nodes[i].id;
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (connected && node_id != ctx->node_id) {
+            message_t msg;
+            memset(&msg, 0, sizeof(msg));
+
+            msg.header.magic = MSG_MAGIC;
+            msg.header.type = MSG_ALLOC_NOTIFY;
+            msg.header.sender = ctx->node_id;
+
+            msg.payload.alloc_notify.start_page_id = start_page_id;
+            msg.payload.alloc_notify.end_page_id = end_page_id;
+            msg.payload.alloc_notify.owner = owner;
+            msg.payload.alloc_notify.num_pages = num_pages;
+
+            LOG_DEBUG("Sending ALLOC_NOTIFY to node %u (pages %lu-%lu, owner=%u)",
+                     node_id, start_page_id, end_page_id, owner);
+
+            int rc = network_send(node_id, &msg);
+            if (rc != DSM_SUCCESS) {
+                LOG_WARN("Failed to send ALLOC_NOTIFY to node %u", node_id);
+            }
+        }
+    }
+
+    return DSM_SUCCESS;
+}
+
+int handle_alloc_notify(const message_t *msg) {
+    page_id_t start_page_id = msg->payload.alloc_notify.start_page_id;
+    page_id_t end_page_id = msg->payload.alloc_notify.end_page_id;
+    node_id_t owner = msg->payload.alloc_notify.owner;
+    size_t num_pages = msg->payload.alloc_notify.num_pages;
+
+    LOG_INFO("Received ALLOC_NOTIFY: pages %lu-%lu owned by node %u (%zu pages)",
+             start_page_id, end_page_id, owner, num_pages);
+
+    /* Register these pages in the local page directory */
+    dsm_context_t *ctx = dsm_get_context();
+    page_directory_t *dir = get_page_directory();
+
+    if (!dir) {
+        LOG_ERROR("Page directory not initialized");
+        return DSM_ERROR_INIT;
+    }
+
+    /* Set owner for all pages in this allocation */
+    for (page_id_t page_id = start_page_id; page_id <= end_page_id; page_id++) {
+        int rc = directory_set_owner(dir, page_id, owner);
+        if (rc != DSM_SUCCESS) {
+            LOG_ERROR("Failed to set owner for page %lu", page_id);
+            return rc;
+        }
+    }
+
+    LOG_DEBUG("Registered %zu remote pages (owner=node %u) in local directory",
+              num_pages, owner);
+
+    return DSM_SUCCESS;
+}
+
 /* Dispatcher */
 int dispatch_message(const message_t *msg) {
     switch (msg->header.type) {
@@ -456,6 +528,8 @@ int dispatch_message(const message_t *msg) {
             return handle_barrier_arrive(msg);
         case MSG_BARRIER_RELEASE:
             return handle_barrier_release(msg);
+        case MSG_ALLOC_NOTIFY:
+            return handle_alloc_notify(msg);
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;

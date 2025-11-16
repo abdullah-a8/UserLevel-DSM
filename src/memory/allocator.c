@@ -9,9 +9,11 @@
 #include "page_table.h"
 #include "../consistency/page_migration.h"
 #include "../consistency/directory.h"
+#include "../network/handlers.h"
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 void* dsm_malloc(size_t size) {
     if (size == 0) {
@@ -108,6 +110,24 @@ void* dsm_malloc(size_t size) {
     pthread_mutex_unlock(&ctx->lock);
 
     LOG_INFO("dsm_malloc: allocated %zu pages at %p", num_pages, addr);
+
+    /* Broadcast allocation to all other nodes if multi-node system */
+    if (ctx->config.num_nodes > 1) {
+        page_id_t start_page_id = new_table->start_page_id;
+        page_id_t end_page_id = start_page_id + num_pages - 1;
+
+        LOG_INFO("Broadcasting allocation: pages %lu-%lu (owner=node %u)",
+                 start_page_id, end_page_id, ctx->node_id);
+
+        int rc = send_alloc_notify(start_page_id, end_page_id, ctx->node_id, num_pages);
+        if (rc != DSM_SUCCESS) {
+            LOG_WARN("Failed to broadcast allocation notification");
+        }
+
+        /* Give other nodes time to process the notification */
+        usleep(50000);  /* 50ms */
+    }
+
     return addr;
 }
 

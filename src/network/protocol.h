@@ -30,6 +30,7 @@ typedef enum {
     MSG_LOCK_RELEASE,          /**< Release a lock */
     MSG_BARRIER_ARRIVE,        /**< Arrive at barrier */
     MSG_BARRIER_RELEASE,       /**< Release all from barrier */
+    MSG_ALLOC_NOTIFY,          /**< Notify nodes of new allocation */
     MSG_NODE_JOIN,             /**< Node joining cluster */
     MSG_NODE_LEAVE,            /**< Node leaving cluster */
     MSG_HEARTBEAT,             /**< Keep-alive heartbeat */
@@ -136,6 +137,17 @@ typedef struct {
 } __attribute__((packed)) barrier_release_payload_t;
 
 /**
+ * ALLOC_NOTIFY message payload
+ * Sent by a node to notify all other nodes of a new allocation
+ */
+typedef struct {
+    page_id_t start_page_id;   /**< First page ID in allocation */
+    page_id_t end_page_id;     /**< Last page ID in allocation (inclusive) */
+    node_id_t owner;           /**< Owner node ID */
+    size_t num_pages;          /**< Number of pages allocated */
+} __attribute__((packed)) alloc_notify_payload_t;
+
+/**
  * NODE_JOIN message payload
  */
 typedef struct {
@@ -180,6 +192,7 @@ typedef struct {
         lock_release_payload_t lock_release;
         barrier_arrive_payload_t barrier_arrive;
         barrier_release_payload_t barrier_release;
+        alloc_notify_payload_t alloc_notify;
         node_join_payload_t node_join;
         node_leave_payload_t node_leave;
         error_payload_t error;

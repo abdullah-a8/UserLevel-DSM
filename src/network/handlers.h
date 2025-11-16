@@ -34,6 +34,10 @@ int send_barrier_release(node_id_t node, barrier_id_t barrier_id);
 int handle_barrier_arrive(const message_t *msg);
 int handle_barrier_release(const message_t *msg);
 
+/* Allocation notification messages */
+int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t owner, size_t num_pages);
+int handle_alloc_notify(const message_t *msg);
+
 /* Dispatch incoming message */
 int dispatch_message(const message_t *msg);
 
