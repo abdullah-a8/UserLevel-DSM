@@ -72,6 +72,20 @@ typedef struct {
 page_table_t* page_table_create(void *base_addr, size_t size, node_id_t node_id, int allocation_index);
 
 /**
+ * Create a page table for a remote allocation (SVAS)
+ *
+ * This is used when receiving ALLOC_NOTIFY from another node.
+ * Creates a local page table that maps to remote page IDs.
+ *
+ * @param base_addr Base address of DSM region (same as remote node)
+ * @param size Total size of region in bytes
+ * @param owner Remote owner node ID
+ * @param start_page_id Starting page ID from remote node
+ * @return Pointer to page table, or NULL on failure
+ */
+page_table_t* page_table_create_remote(void *base_addr, size_t size, node_id_t owner, page_id_t start_page_id);
+
+/**
  * Destroy a page table
  *
  * @param table Page table to destroy

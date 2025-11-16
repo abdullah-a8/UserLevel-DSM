@@ -111,21 +111,21 @@ void* dsm_malloc(size_t size) {
 
     LOG_INFO("dsm_malloc: allocated %zu pages at %p", num_pages, addr);
 
-    /* Broadcast allocation to all other nodes if multi-node system */
+    /* Broadcast allocation to all other nodes for SVAS */
     if (ctx->config.num_nodes > 1) {
         page_id_t start_page_id = new_table->start_page_id;
         page_id_t end_page_id = start_page_id + num_pages - 1;
 
-        LOG_INFO("Broadcasting allocation: pages %lu-%lu (owner=node %u)",
-                 start_page_id, end_page_id, ctx->node_id);
+        LOG_INFO("Broadcasting SVAS allocation: pages %lu-%lu at addr=%p, size=%zu (owner=node %u)",
+                 start_page_id, end_page_id, addr, aligned_size, ctx->node_id);
 
-        int rc = send_alloc_notify(start_page_id, end_page_id, ctx->node_id, num_pages);
+        int rc = send_alloc_notify(start_page_id, end_page_id, ctx->node_id, num_pages, addr, aligned_size);
         if (rc != DSM_SUCCESS) {
             LOG_WARN("Failed to broadcast allocation notification");
         }
 
-        /* Give other nodes time to process the notification */
-        usleep(50000);  /* 50ms */
+        /* Give other nodes time to create SVAS mapping */
+        usleep(100000);  /* 100ms - increased for SVAS setup */
     }
 
     return addr;

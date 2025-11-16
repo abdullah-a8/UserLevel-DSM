@@ -139,12 +139,15 @@ typedef struct {
 /**
  * ALLOC_NOTIFY message payload
  * Sent by a node to notify all other nodes of a new allocation
+ * Workers must create mmap at the same virtual address for SVAS
  */
 typedef struct {
     page_id_t start_page_id;   /**< First page ID in allocation */
     page_id_t end_page_id;     /**< Last page ID in allocation (inclusive) */
     node_id_t owner;           /**< Owner node ID */
     size_t num_pages;          /**< Number of pages allocated */
+    uint64_t base_addr;        /**< Virtual address of allocation (for SVAS) */
+    size_t total_size;         /**< Total size in bytes */
 } __attribute__((packed)) alloc_notify_payload_t;
 
 /**

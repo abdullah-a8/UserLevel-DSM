@@ -28,14 +28,17 @@
 void test_ping_pong(int node_id, int num_nodes) {
     printf("[Node %d] Starting ping-pong test...\n", node_id);
 
-    int *shared_value = (int*)dsm_malloc(sizeof(int));
-    if (!shared_value) {
-        printf("[Node %d] Failed to allocate DSM memory\n", node_id);
-        return;
-    }
+    int *shared_value = NULL;
 
+    /* Only Node 0 allocates - this is the proper DSM usage pattern */
     if (node_id == 0) {
-        /* Node 0: Write initial value */
+        shared_value = (int*)dsm_malloc(sizeof(int));
+        if (!shared_value) {
+            printf("[Node %d] Failed to allocate DSM memory\n", node_id);
+            return;
+        }
+
+        /* Write initial value */
         *shared_value = 42;
         printf("[Node %d] Wrote value: %d\n", node_id, *shared_value);
 
@@ -51,11 +54,28 @@ void test_ping_pong(int node_id, int num_nodes) {
         } else {
             printf("[Node %d] ✗ Ping-pong test FAILED\n", node_id);
         }
+
+        dsm_free(shared_value);
     } else if (node_id == 1) {
-        /* Node 1: Wait for Node 0 to write */
+        /* Node 1: Wait for Node 0's allocation to be broadcasted */
         sleep(1);
 
-        /* Read value from Node 0 */
+        /* Node 1 will fault on the page owned by Node 0 when it accesses it
+         * For now, use a fixed address from Node 0's allocation space
+         * In a real DSM, this would be communicated via a coordination protocol */
+
+        /* FIXME: This is a workaround - ideally Node 0 would send the address
+         * For now, we know Node 0 allocates at page_id 0, which corresponds to
+         * its first mmap address. We'll just create a local allocation that will
+         * trigger page faults when accessed. */
+
+        shared_value = (int*)dsm_malloc(sizeof(int));
+        if (!shared_value) {
+            printf("[Node %d] Failed to allocate DSM memory\n", node_id);
+            return;
+        }
+
+        /* Read value from Node 0 - this should trigger a page fault and fetch from Node 0 */
         int value = *shared_value;
         printf("[Node %d] Read value: %d (expected 42)\n", node_id, value);
 
@@ -65,10 +85,14 @@ void test_ping_pong(int node_id, int num_nodes) {
 
         sleep(1);  /* Give Node 0 time to read */
 
-        printf("[Node %d] ✓ Ping-pong test PASSED\n", node_id);
-    }
+        if (value == 42) {
+            printf("[Node %d] ✓ Ping-pong test PASSED\n", node_id);
+        } else {
+            printf("[Node %d] ✗ Ping-pong test FAILED\n", node_id);
+        }
 
-    dsm_free(shared_value);
+        dsm_free(shared_value);
+    }
 }
 
 /**

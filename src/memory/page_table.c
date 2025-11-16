@@ -73,6 +73,53 @@ page_table_t* page_table_create(void *base_addr, size_t size, node_id_t node_id,
     return table;
 }
 
+page_table_t* page_table_create_remote(void *base_addr, size_t size, node_id_t owner, page_id_t start_page_id) {
+    if (!base_addr || size == 0) {
+        LOG_ERROR("Invalid parameters: base_addr=%p, size=%zu", base_addr, size);
+        return NULL;
+    }
+
+    page_table_t *table = malloc(sizeof(page_table_t));
+    if (!table) {
+        LOG_ERROR("Failed to allocate page table");
+        return NULL;
+    }
+
+    table->base_addr = base_addr;
+    table->total_size = size;
+    table->num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    table->start_page_id = start_page_id;  /* Use remote node's page IDs */
+
+    table->entries = calloc(table->num_pages, sizeof(page_entry_t));
+    if (!table->entries) {
+        LOG_ERROR("Failed to allocate page entries");
+        free(table);
+        return NULL;
+    }
+
+    pthread_mutex_init(&table->lock, NULL);
+    table->refcount = 1;
+
+    /* Initialize all entries with remote page IDs and owner */
+    for (size_t i = 0; i < table->num_pages; i++) {
+        table->entries[i].id = start_page_id + i;
+        table->entries[i].local_addr = (char*)base_addr + (i * PAGE_SIZE);
+        table->entries[i].owner = owner;  /* Remote owner */
+        table->entries[i].state = PAGE_STATE_INVALID;  /* Start invalid, will fetch on fault */
+        table->entries[i].version = 0;
+        table->entries[i].is_allocated = true;
+        table->entries[i].request_pending = false;
+        table->entries[i].num_waiting_threads = 0;
+        pthread_cond_init(&table->entries[i].ready_cv, NULL);
+        pthread_mutex_init(&table->entries[i].entry_lock, NULL);
+    }
+
+    LOG_INFO("Remote page table created: base=%p, size=%zu, pages=%zu, id_range=%lu-%lu (owner=node %u)",
+             base_addr, size, table->num_pages, start_page_id,
+             start_page_id + table->num_pages - 1, owner);
+    return table;
+}
+
 void page_table_destroy(page_table_t *table) {
     if (!table) {
         return;

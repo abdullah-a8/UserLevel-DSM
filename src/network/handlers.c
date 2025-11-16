@@ -12,6 +12,8 @@
 #include "../consistency/directory.h"
 #include "../consistency/page_migration.h"
 #include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
 
 /* PAGE_REQUEST */
 int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) {
@@ -438,7 +440,7 @@ int handle_barrier_release(const message_t *msg) {
 }
 
 /* ALLOC_NOTIFY */
-int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t owner, size_t num_pages) {
+int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t owner, size_t num_pages, void *base_addr, size_t total_size) {
     dsm_context_t *ctx = dsm_get_context();
 
     /* Broadcast to all connected nodes */
@@ -460,9 +462,11 @@ int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t 
             msg.payload.alloc_notify.end_page_id = end_page_id;
             msg.payload.alloc_notify.owner = owner;
             msg.payload.alloc_notify.num_pages = num_pages;
+            msg.payload.alloc_notify.base_addr = (uint64_t)base_addr;
+            msg.payload.alloc_notify.total_size = total_size;
 
-            LOG_DEBUG("Sending ALLOC_NOTIFY to node %u (pages %lu-%lu, owner=%u)",
-                     node_id, start_page_id, end_page_id, owner);
+            LOG_INFO("Sending ALLOC_NOTIFY to node %u (pages %lu-%lu, addr=%p, size=%zu, owner=%u)",
+                     node_id, start_page_id, end_page_id, base_addr, total_size, owner);
 
             int rc = network_send(node_id, &msg);
             if (rc != DSM_SUCCESS) {
@@ -479,30 +483,81 @@ int handle_alloc_notify(const message_t *msg) {
     page_id_t end_page_id = msg->payload.alloc_notify.end_page_id;
     node_id_t owner = msg->payload.alloc_notify.owner;
     size_t num_pages = msg->payload.alloc_notify.num_pages;
+    void *base_addr = (void*)msg->payload.alloc_notify.base_addr;
+    size_t total_size = msg->payload.alloc_notify.total_size;
 
-    LOG_INFO("Received ALLOC_NOTIFY: pages %lu-%lu owned by node %u (%zu pages)",
-             start_page_id, end_page_id, owner, num_pages);
+    LOG_INFO("Received ALLOC_NOTIFY: pages %lu-%lu at addr=%p, size=%zu, owned by node %u",
+             start_page_id, end_page_id, base_addr, total_size, owner);
 
-    /* Register these pages in the local page directory */
     dsm_context_t *ctx = dsm_get_context();
-    page_directory_t *dir = get_page_directory();
 
-    if (!dir) {
-        LOG_ERROR("Page directory not initialized");
-        return DSM_ERROR_INIT;
+    /* CRITICAL: Create mmap at the SAME virtual address for SVAS
+     * This ensures all nodes share the same virtual address space */
+    void *addr = mmap(base_addr, total_size, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+    if (addr == MAP_FAILED || addr != base_addr) {
+        LOG_ERROR("Failed to create SVAS mapping at %p (got %p): %s",
+                  base_addr, addr, strerror(errno));
+        return DSM_ERROR_MEMORY;
     }
 
-    /* Set owner for all pages in this allocation */
-    for (page_id_t page_id = start_page_id; page_id <= end_page_id; page_id++) {
-        int rc = directory_set_owner(dir, page_id, owner);
-        if (rc != DSM_SUCCESS) {
-            LOG_ERROR("Failed to set owner for page %lu", page_id);
+    LOG_INFO("Created SVAS mapping at %p (size=%zu) for remote allocation",
+             addr, total_size);
+
+    /* Create page table for this remote allocation */
+    pthread_mutex_lock(&ctx->lock);
+
+    if (ctx->num_allocations >= 32) {
+        pthread_mutex_unlock(&ctx->lock);
+        munmap(addr, total_size);
+        LOG_ERROR("Maximum number of allocations (32) exceeded");
+        return DSM_ERROR_MEMORY;
+    }
+
+    /* Create page table with the SAME page IDs as owner */
+    page_table_t *new_table = page_table_create_remote(addr, total_size, owner, start_page_id);
+    if (!new_table) {
+        pthread_mutex_unlock(&ctx->lock);
+        munmap(addr, total_size);
+        LOG_ERROR("Failed to create remote page table");
+        return DSM_ERROR_MEMORY;
+    }
+
+    /* Add to list of page tables */
+    ctx->page_tables[ctx->num_allocations] = new_table;
+    ctx->num_allocations++;
+
+    /* Initialize page directory if needed */
+    page_directory_t *dir = get_page_directory();
+    if (!dir) {
+        /* First remote allocation - initialize directory */
+        int rc = consistency_init(100000);
+        if (rc != DSM_SUCCESS && rc != DSM_ERROR_INIT) {
+            LOG_ERROR("Failed to initialize consistency module");
+            page_table_destroy(new_table);
+            ctx->page_tables[ctx->num_allocations - 1] = NULL;
+            ctx->num_allocations--;
+            pthread_mutex_unlock(&ctx->lock);
+            munmap(addr, total_size);
             return rc;
         }
+        dir = get_page_directory();
     }
 
-    LOG_DEBUG("Registered %zu remote pages (owner=node %u) in local directory",
-              num_pages, owner);
+    /* Register pages in directory with remote owner */
+    if (dir) {
+        for (page_id_t page_id = start_page_id; page_id <= end_page_id; page_id++) {
+            directory_set_owner(dir, page_id, owner);
+        }
+        LOG_DEBUG("Registered %zu remote pages (owner=node %u) in directory",
+                  num_pages, owner);
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    LOG_INFO("SVAS setup complete: local addr=%p maps to remote pages %lu-%lu (owner=node %u)",
+             addr, start_page_id, end_page_id, owner);
 
     return DSM_SUCCESS;
 }
