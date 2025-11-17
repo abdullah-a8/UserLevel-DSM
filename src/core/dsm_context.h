@@ -23,7 +23,26 @@ typedef struct {
     uint16_t port;
     int sockfd;
     bool connected;
+
+    /* Failure detection */
+    uint64_t last_heartbeat_time;  /**< Timestamp of last heartbeat (nanoseconds) */
+    int missed_heartbeats;         /**< Consecutive missed heartbeats */
+    bool is_failed;                /**< True if node is considered failed */
 } node_info_t;
+
+/**
+ * Allocation ACK tracking
+ */
+typedef struct {
+    page_id_t start_page_id;       /**< Start of allocation being tracked */
+    page_id_t end_page_id;         /**< End of allocation being tracked */
+    int expected_acks;             /**< Number of ACKs expected */
+    int received_acks;             /**< Number of ACKs received */
+    bool acks_received[MAX_NODES]; /**< Track which nodes have ACK'd */
+    pthread_mutex_t lock;          /**< Lock for this structure */
+    pthread_cond_t all_acks_cv;    /**< Signaled when all ACKs received */
+    bool active;                   /**< True if tracking an allocation */
+} alloc_ack_tracker_t;
 
 /**
  * Network state
@@ -34,6 +53,7 @@ typedef struct {
     node_info_t nodes[MAX_NODES];
     int num_nodes;
     pthread_t dispatcher_thread;
+    pthread_t heartbeat_thread;    /**< Heartbeat sender/checker thread */
     msg_queue_t *send_queue;
     bool running;
 
@@ -41,6 +61,13 @@ typedef struct {
     int pending_sockets[MAX_NODES];
     int num_pending;
     pthread_mutex_t pending_lock;
+
+    /* Sequence number for messages (for debugging and message tracking) */
+    uint64_t next_seq_num;
+    pthread_mutex_t seq_lock;
+
+    /* Allocation ACK tracking */
+    alloc_ack_tracker_t alloc_tracker;
 } network_state_t;
 
 /**
@@ -64,6 +91,7 @@ typedef struct {
     page_table_t *page_table;  /* Primary page table (for backward compatibility) */
     page_table_t *page_tables[32];  /* Support up to 32 separate allocations */
     int num_allocations;
+    pthread_mutex_t allocation_lock;  /* BUG FIX (BUG 3): Serialize allocations to prevent tracker corruption */
 
     /* Network */
     network_state_t network;

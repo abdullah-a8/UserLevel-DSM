@@ -63,6 +63,7 @@ page_table_t* page_table_create(void *base_addr, size_t size, node_id_t node_id,
         table->entries[i].is_allocated = true;
         table->entries[i].request_pending = false;
         table->entries[i].num_waiting_threads = 0;
+        table->entries[i].fetch_result = DSM_SUCCESS;  /* Initialize to success */
         table->entries[i].pending_inv_acks = 0;
         pthread_cond_init(&table->entries[i].ready_cv, NULL);
         pthread_cond_init(&table->entries[i].inv_ack_cv, NULL);
@@ -112,6 +113,7 @@ page_table_t* page_table_create_remote(void *base_addr, size_t size, node_id_t o
         table->entries[i].is_allocated = true;
         table->entries[i].request_pending = false;
         table->entries[i].num_waiting_threads = 0;
+        table->entries[i].fetch_result = DSM_SUCCESS;  /* Initialize to success */
         table->entries[i].pending_inv_acks = 0;
         pthread_cond_init(&table->entries[i].ready_cv, NULL);
         pthread_cond_init(&table->entries[i].inv_ack_cv, NULL);

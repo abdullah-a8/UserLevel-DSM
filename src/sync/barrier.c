@@ -109,9 +109,13 @@ int dsm_barrier(barrier_id_t barrier_id, int num_participants) {
                 }
             }
 
+            /* CRITICAL FIX: Increment generation BEFORE resetting count
+             * This prevents race where fast nodes re-enter before others leave
+             * Based on sense-reversal barrier best practices */
+            barrier->generation++;
+
             /* Reset barrier for reuse */
             barrier->arrived_count = 0;
-            barrier->generation++;  /* Increment generation */
 
             /* Wake up local threads */
             pthread_cond_broadcast(&barrier->all_arrived_cv);
@@ -204,11 +208,17 @@ int barrier_manager_arrive(barrier_id_t barrier_id, node_id_t arriver, int num_p
             }
         }
 
-        /* Wake up any local threads waiting on this barrier */
-        pthread_cond_broadcast(&barrier->all_arrived_cv);
+        /* CRITICAL FIX: Increment generation BEFORE resetting count
+         * This prevents race where fast nodes re-enter before others leave
+         * Based on sense-reversal barrier best practices */
+        barrier->generation++;
 
         /* Reset barrier for reuse */
         barrier->arrived_count = 0;
+
+        /* Wake up any local threads waiting on this barrier */
+        pthread_cond_broadcast(&barrier->all_arrived_cv);
+
         pthread_mutex_unlock(&barrier->lock);
     } else {
         pthread_mutex_unlock(&barrier->lock);

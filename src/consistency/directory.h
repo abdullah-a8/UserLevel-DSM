@@ -126,4 +126,48 @@ int directory_get_sharers(page_directory_t *dir, page_id_t page_id,
  */
 int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owner);
 
+/**
+ * Clear all sharers for a page
+ * Should be called after all invalidation ACKs are received
+ *
+ * @param dir Page directory
+ * @param page_id Page identifier
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int directory_clear_sharers(page_directory_t *dir, page_id_t page_id);
+
+/**
+ * Remove a directory entry (frees memory)
+ * Should be called when a page is freed
+ *
+ * @param dir Page directory
+ * @param page_id Page identifier
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int directory_remove_entry(page_directory_t *dir, page_id_t page_id);
+
+/**
+ * Handle node failure - remove failed node from all directory entries
+ * This is called when a node is detected as failed via heartbeat timeout
+ * Pages owned by the failed node are marked as having no owner (-1)
+ * Failed node is removed from all sharer lists
+ *
+ * @param dir Page directory
+ * @param failed_node Node ID that has failed
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int directory_handle_node_failure(page_directory_t *dir, node_id_t failed_node);
+
+/**
+ * Reclaim ownership of a page from a failed node
+ * Called when a page request to a failed node times out
+ * Transfers ownership to the requesting node
+ *
+ * @param dir Page directory
+ * @param page_id Page identifier
+ * @param new_owner Node claiming ownership
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int directory_reclaim_ownership(page_directory_t *dir, page_id_t page_id, node_id_t new_owner);
+
 #endif /* DIRECTORY_H */

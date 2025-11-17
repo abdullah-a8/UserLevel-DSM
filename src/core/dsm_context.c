@@ -38,6 +38,7 @@ int dsm_context_init(const dsm_config_t *config) {
     /* Initialize mutexes */
     pthread_mutex_init(&ctx->lock, NULL);
     pthread_mutex_init(&ctx->stats_lock, NULL);
+    pthread_mutex_init(&ctx->allocation_lock, NULL);  /* BUG FIX (BUG 3): Initialize allocation lock */
 
     /* Initialize network state */
     ctx->network.server_sockfd = -1;
@@ -45,13 +46,29 @@ int dsm_context_init(const dsm_config_t *config) {
     ctx->network.num_nodes = 0;
     ctx->network.running = false;
     ctx->network.dispatcher_thread = 0;
+    ctx->network.heartbeat_thread = 0;
     ctx->network.send_queue = msg_queue_create();
     ctx->network.num_pending = 0;
     pthread_mutex_init(&ctx->network.pending_lock, NULL);
+    ctx->network.next_seq_num = 1;  /* Start at 1 (0 reserved) */
+    pthread_mutex_init(&ctx->network.seq_lock, NULL);
+
+    /* Initialize allocation ACK tracker */
+    ctx->network.alloc_tracker.active = false;
+    ctx->network.alloc_tracker.expected_acks = 0;
+    ctx->network.alloc_tracker.received_acks = 0;
+    pthread_mutex_init(&ctx->network.alloc_tracker.lock, NULL);
+    pthread_cond_init(&ctx->network.alloc_tracker.all_acks_cv, NULL);
+    for (int i = 0; i < MAX_NODES; i++) {
+        ctx->network.alloc_tracker.acks_received[i] = false;
+    }
 
     for (int i = 0; i < MAX_NODES; i++) {
         ctx->network.nodes[i].connected = false;
         ctx->network.nodes[i].sockfd = -1;
+        ctx->network.nodes[i].last_heartbeat_time = 0;
+        ctx->network.nodes[i].missed_heartbeats = 0;
+        ctx->network.nodes[i].is_failed = false;
         ctx->network.pending_sockets[i] = -1;
     }
 
@@ -116,6 +133,11 @@ void dsm_context_cleanup(void) {
     }
     pthread_mutex_unlock(&ctx->network.pending_lock);
     pthread_mutex_destroy(&ctx->network.pending_lock);
+    pthread_mutex_destroy(&ctx->network.seq_lock);
+
+    /* Cleanup allocation tracker */
+    pthread_mutex_destroy(&ctx->network.alloc_tracker.lock);
+    pthread_cond_destroy(&ctx->network.alloc_tracker.all_acks_cv);
 
     if (ctx->network.server_sockfd >= 0) {
         close(ctx->network.server_sockfd);
@@ -149,6 +171,7 @@ void dsm_context_cleanup(void) {
 
     pthread_mutex_destroy(&ctx->lock);
     pthread_mutex_destroy(&ctx->stats_lock);
+    pthread_mutex_destroy(&ctx->allocation_lock);  /* BUG FIX: Destroy allocation_lock to prevent resource leak */
 
     ctx->initialized = false;
     LOG_INFO("DSM context cleanup complete");

@@ -31,9 +31,11 @@ typedef enum {
     MSG_BARRIER_ARRIVE,        /**< Arrive at barrier */
     MSG_BARRIER_RELEASE,       /**< Release all from barrier */
     MSG_ALLOC_NOTIFY,          /**< Notify nodes of new allocation */
+    MSG_ALLOC_ACK,             /**< Acknowledge allocation notification */
     MSG_NODE_JOIN,             /**< Node joining cluster */
     MSG_NODE_LEAVE,            /**< Node leaving cluster */
     MSG_HEARTBEAT,             /**< Keep-alive heartbeat */
+    MSG_HEARTBEAT_ACK,         /**< Acknowledge heartbeat (optional) */
     MSG_ERROR                  /**< Error response */
 } msg_type_t;
 
@@ -75,6 +77,7 @@ typedef struct {
 typedef struct {
     page_id_t page_id;         /**< Page ID */
     uint64_t version;          /**< Page version number */
+    access_type_t access;      /**< Access type granted (READ or WRITE) */
     uint8_t data[PAGE_SIZE];   /**< Page data (4KB) */
 } __attribute__((packed)) page_reply_payload_t;
 
@@ -167,6 +170,23 @@ typedef struct {
 } __attribute__((packed)) node_leave_payload_t;
 
 /**
+ * ALLOC_ACK message payload
+ */
+typedef struct {
+    page_id_t start_page_id;   /**< First page ID in allocation */
+    page_id_t end_page_id;     /**< Last page ID in allocation (inclusive) */
+    node_id_t acker;           /**< Node that acknowledged */
+} __attribute__((packed)) alloc_ack_payload_t;
+
+/**
+ * HEARTBEAT_ACK message payload (optional, can be empty)
+ */
+typedef struct {
+    node_id_t acker;           /**< Node that acknowledged */
+    uint64_t timestamp;        /**< Timestamp of ACK */
+} __attribute__((packed)) heartbeat_ack_payload_t;
+
+/**
  * ERROR message payload
  */
 typedef struct {
@@ -196,8 +216,10 @@ typedef struct {
         barrier_arrive_payload_t barrier_arrive;
         barrier_release_payload_t barrier_release;
         alloc_notify_payload_t alloc_notify;
+        alloc_ack_payload_t alloc_ack;
         node_join_payload_t node_join;
         node_leave_payload_t node_leave;
+        heartbeat_ack_payload_t heartbeat_ack;
         error_payload_t error;
         uint8_t raw[PAGE_SIZE + 256]; /**< Raw buffer for largest payload */
     } payload;

@@ -225,6 +225,10 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             memcpy(buffer + offset, &msg->payload.alloc_notify, sizeof(alloc_notify_payload_t));
             offset += sizeof(alloc_notify_payload_t);
             break;
+        case MSG_ALLOC_ACK:
+            memcpy(buffer + offset, &msg->payload.alloc_ack, sizeof(alloc_ack_payload_t));
+            offset += sizeof(alloc_ack_payload_t);
+            break;
         case MSG_NODE_JOIN:
             memcpy(buffer + offset, &msg->payload.node_join, sizeof(node_join_payload_t));
             offset += sizeof(node_join_payload_t);
@@ -235,6 +239,10 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             break;
         case MSG_HEARTBEAT:
             /* Heartbeat has no payload */
+            break;
+        case MSG_HEARTBEAT_ACK:
+            memcpy(buffer + offset, &msg->payload.heartbeat_ack, sizeof(heartbeat_ack_payload_t));
+            offset += sizeof(heartbeat_ack_payload_t);
             break;
         case MSG_ERROR:
             memcpy(buffer + offset, &msg->payload.error, sizeof(error_payload_t));
@@ -260,6 +268,20 @@ int deserialize_message(const uint8_t *buffer, size_t len, message_t *msg) {
     memcpy(&msg->header, buffer + offset, sizeof(msg_header_t));
     offset += sizeof(msg_header_t);
 
+    /* CRITICAL: Validate magic number to detect corruption
+     * This prevents processing of corrupted or malformed messages */
+    if (msg->header.magic != MSG_MAGIC) {
+        LOG_ERROR("Invalid magic number: expected 0x%X, got 0x%X",
+                  MSG_MAGIC, msg->header.magic);
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Validate message type */
+    if (msg->header.type < 1 || msg->header.type > MSG_ERROR) {
+        LOG_ERROR("Invalid message type: %d", msg->header.type);
+        return DSM_ERROR_INVALID;
+    }
+
     /* Payload */
     size_t remaining = len - offset;
     if (remaining > 0) {
@@ -269,12 +291,17 @@ int deserialize_message(const uint8_t *buffer, size_t len, message_t *msg) {
     return DSM_SUCCESS;
 }
 
-int network_send(node_id_t dest, const message_t *msg) {
+int network_send(node_id_t dest, message_t *msg) {
     if (!msg || dest >= MAX_NODES) {
         return DSM_ERROR_INVALID;
     }
 
     dsm_context_t *ctx = dsm_get_context();
+
+    /* Assign sequence number atomically for message tracking and debugging */
+    pthread_mutex_lock(&ctx->network.seq_lock);
+    msg->header.seq_num = ctx->network.next_seq_num++;
+    pthread_mutex_unlock(&ctx->network.seq_lock);
 
     pthread_mutex_lock(&ctx->lock);
     if (!ctx->network.nodes[dest].connected) {
@@ -282,6 +309,14 @@ int network_send(node_id_t dest, const message_t *msg) {
         LOG_ERROR("Node %u not connected", dest);
         return DSM_ERROR_NETWORK;
     }
+
+    /* PERFORMANCE FIX: Check if node has failed - avoid sending to dead nodes */
+    if (ctx->network.nodes[dest].is_failed) {
+        pthread_mutex_unlock(&ctx->lock);
+        LOG_WARN("Skipping send to failed node %u (detected via heartbeat)", dest);
+        return DSM_ERROR_NETWORK;
+    }
+
     int sockfd = ctx->network.nodes[dest].sockfd;
     pthread_mutex_unlock(&ctx->lock);
 
@@ -456,6 +491,13 @@ void network_shutdown(void) {
     pthread_mutex_lock(&ctx->lock);
     bool was_running = ctx->network.running;
     ctx->network.running = false;
+    pthread_mutex_unlock(&ctx->lock);
+
+    /* CRITICAL FIX #2: Stop heartbeat thread before closing connections */
+    extern void stop_heartbeat_thread(void);
+    stop_heartbeat_thread();
+
+    pthread_mutex_lock(&ctx->lock);
     int server_fd = ctx->network.server_sockfd;
     ctx->network.server_sockfd = -1;
     pthread_t thread = ctx->network.dispatcher_thread;

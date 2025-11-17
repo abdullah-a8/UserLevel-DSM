@@ -10,6 +10,7 @@
 #include "../memory/fault_handler.h"
 #include "../consistency/page_migration.h"
 #include "../network/network.h"
+#include "../network/handlers.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -61,6 +62,9 @@ int dsm_init(const dsm_config_t *config) {
                 dsm_context_cleanup();
                 return rc;
             }
+
+            /* CRITICAL FIX #2: Start heartbeat thread for failure detection */
+            start_heartbeat_thread();
 
             /* Wait for all workers to connect */
             LOG_INFO("Waiting for %d workers to connect...", config->num_nodes - 1);
@@ -115,6 +119,9 @@ int dsm_init(const dsm_config_t *config) {
                 dsm_context_cleanup();
                 return rc;
             }
+
+            /* CRITICAL FIX #2: Start heartbeat thread for failure detection */
+            start_heartbeat_thread();
 
             /* Send NODE_JOIN to identify ourselves to the manager */
             LOG_INFO("Sending NODE_JOIN to manager (node_id=%u)", config->node_id);

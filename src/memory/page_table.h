@@ -32,6 +32,7 @@ typedef struct {
     /* For request queuing (Task 8.1) */
     bool request_pending;      /**< True if page transfer in progress */
     int num_waiting_threads;   /**< Number of threads waiting for this page */
+    int fetch_result;          /**< Result of fetch operation (DSM_SUCCESS or error code) */
     pthread_cond_t ready_cv;   /**< Condition variable for waiting threads */
     pthread_mutex_t entry_lock;/**< Per-entry lock for finer-grained locking */
 

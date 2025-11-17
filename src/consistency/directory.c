@@ -198,14 +198,34 @@ int directory_set_writer(page_directory_t *dir, page_id_t page_id, node_id_t wri
         }
     }
 
-    /* Set new owner and clear sharers */
+    /* Set new owner but DO NOT clear sharers yet
+     * Sharers will be cleared after all invalidation ACKs are received
+     * This prevents a race where new readers could be added before invalidations complete */
     entry->owner = writer;
-    entry->sharers.count = 0;
 
     LOG_DEBUG("Set node %u as writer for page %lu (%d nodes to invalidate)",
               writer, page_id, *num_invalidate);
 
     pthread_mutex_unlock(&entry->lock);
+    return DSM_SUCCESS;
+}
+
+int directory_clear_sharers(page_directory_t *dir, page_id_t page_id) {
+    if (!dir) {
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Find entry (don't create if doesn't exist) */
+    directory_entry_t *entry = find_entry(dir, page_id);
+    if (!entry) {
+        return DSM_SUCCESS;  /* No entry, nothing to clear */
+    }
+
+    pthread_mutex_lock(&entry->lock);
+    entry->sharers.count = 0;
+    LOG_DEBUG("Cleared sharer list for page %lu", page_id);
+    pthread_mutex_unlock(&entry->lock);
+
     return DSM_SUCCESS;
 }
 
@@ -277,6 +297,129 @@ int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owne
     pthread_mutex_lock(&entry->lock);
     entry->owner = owner;
     pthread_mutex_unlock(&entry->lock);
+
+    return DSM_SUCCESS;
+}
+
+int directory_remove_entry(page_directory_t *dir, page_id_t page_id) {
+    if (!dir) {
+        return DSM_ERROR_INVALID;
+    }
+
+    size_t bucket = hash_page_id(page_id, dir->table_size);
+
+    pthread_mutex_lock(&dir->lock);
+
+    directory_entry_t **curr = &dir->buckets[bucket];
+    directory_entry_t *prev = NULL;
+
+    /* Search for entry in chain */
+    while (*curr != NULL) {
+        if ((*curr)->page_id == page_id) {
+            /* Found it - remove from chain */
+            directory_entry_t *to_free = *curr;
+            *curr = to_free->next;  /* Unlink from chain */
+            dir->num_entries--;
+
+            pthread_mutex_unlock(&dir->lock);
+
+            /* Free the entry (destroy its mutex first) */
+            pthread_mutex_destroy(&to_free->lock);
+            free(to_free);
+
+            LOG_DEBUG("Removed directory entry for page %lu (total entries: %zu)",
+                      page_id, dir->num_entries);
+            return DSM_SUCCESS;
+        }
+        prev = *curr;
+        curr = &(*curr)->next;
+    }
+
+    pthread_mutex_unlock(&dir->lock);
+    return DSM_SUCCESS;  /* Entry not found, nothing to remove */
+}
+
+int directory_handle_node_failure(page_directory_t *dir, node_id_t failed_node) {
+    if (!dir) {
+        return DSM_ERROR_INVALID;
+    }
+
+    LOG_INFO("Handling failure of node %u - cleaning up directory", failed_node);
+
+    int pages_cleared = 0;
+    int sharers_removed = 0;
+
+    pthread_mutex_lock(&dir->lock);
+
+    /* Iterate through all buckets in hash table */
+    for (size_t bucket = 0; bucket < dir->table_size; bucket++) {
+        directory_entry_t *entry = dir->buckets[bucket];
+
+        /* Iterate through linked list in this bucket */
+        while (entry != NULL) {
+            pthread_mutex_lock(&entry->lock);
+
+            /* If failed node owns this page, mark as unowned */
+            if (entry->owner == failed_node) {
+                entry->owner = (node_id_t)-1;  /* No owner */
+                pages_cleared++;
+                LOG_DEBUG("Cleared ownership of page %lu (was owned by failed node %u)",
+                         entry->page_id, failed_node);
+            }
+
+            /* Remove failed node from sharer list */
+            for (int i = 0; i < entry->sharers.count; i++) {
+                if (entry->sharers.nodes[i] == failed_node) {
+                    /* Shift remaining elements */
+                    for (int j = i; j < entry->sharers.count - 1; j++) {
+                        entry->sharers.nodes[j] = entry->sharers.nodes[j + 1];
+                    }
+                    entry->sharers.count--;
+                    sharers_removed++;
+                    LOG_DEBUG("Removed failed node %u from sharers of page %lu",
+                             failed_node, entry->page_id);
+                    break;  /* Node can only appear once in sharer list */
+                }
+            }
+
+            pthread_mutex_unlock(&entry->lock);
+            entry = entry->next;
+        }
+    }
+
+    pthread_mutex_unlock(&dir->lock);
+
+    LOG_INFO("Node %u failure cleanup complete: %d pages cleared, %d sharer entries removed",
+             failed_node, pages_cleared, sharers_removed);
+
+    return DSM_SUCCESS;
+}
+
+int directory_reclaim_ownership(page_directory_t *dir, page_id_t page_id, node_id_t new_owner) {
+    if (!dir) {
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Find or create entry */
+    directory_entry_t *entry = find_or_create_entry(dir, page_id);
+    if (!entry) {
+        return DSM_ERROR_MEMORY;
+    }
+
+    pthread_mutex_lock(&entry->lock);
+
+    node_id_t old_owner = entry->owner;
+
+    /* Transfer ownership to new owner */
+    entry->owner = new_owner;
+
+    /* Clear sharer list (new owner has exclusive access) */
+    entry->sharers.count = 0;
+
+    pthread_mutex_unlock(&entry->lock);
+
+    LOG_INFO("Reclaimed ownership of page %lu: old_owner=%u (failed), new_owner=%u",
+             page_id, old_owner, new_owner);
 
     return DSM_SUCCESS;
 }

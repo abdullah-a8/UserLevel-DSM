@@ -21,8 +21,9 @@ int network_connect_to_node(node_id_t node_id, const char *hostname, uint16_t po
 
 /**
  * Send message to node
+ * Note: msg is non-const because sequence number is assigned during send
  */
-int network_send(node_id_t dest, const message_t *msg);
+int network_send(node_id_t dest, message_t *msg);
 
 /**
  * Receive message (blocking)

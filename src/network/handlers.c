@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 
 /* PAGE_REQUEST */
 int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) {
@@ -72,8 +73,31 @@ int handle_page_request(const message_t *msg) {
         return DSM_ERROR_NOT_FOUND;
     }
 
-    /* Send page data */
-    int rc = send_page_reply(requester, page_id, entry->local_addr);
+    /* CRITICAL: Validate page state before serving
+     * Do not serve pages that have been invalidated
+     * This prevents serving stale data when directory is out of sync */
+    pthread_mutex_lock(&owning_table->lock);
+    page_state_t current_state = entry->state;
+    pthread_mutex_unlock(&owning_table->lock);
+
+    if (current_state == PAGE_STATE_INVALID) {
+        LOG_ERROR("Cannot serve page %lu - page is INVALID (no longer owner)", page_id);
+        page_table_release(owning_table);
+        /* Send error message to requester */
+        message_t err_msg;
+        memset(&err_msg, 0, sizeof(err_msg));
+        err_msg.header.magic = MSG_MAGIC;
+        err_msg.header.type = MSG_ERROR;
+        err_msg.header.sender = ctx->node_id;
+        err_msg.payload.error.error_code = DSM_ERROR_INVALID;
+        snprintf(err_msg.payload.error.error_msg, 256,
+                 "Page %lu is INVALID - requester should retry directory lookup", page_id);
+        network_send(requester, &err_msg);
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Send page data with the requested access type */
+    int rc = send_page_reply(requester, page_id, access, entry->local_addr);
     if (rc != DSM_SUCCESS) {
         page_table_release(owning_table);
         return rc;
@@ -133,7 +157,7 @@ int handle_page_request(const message_t *msg) {
 }
 
 /* PAGE_REPLY */
-int send_page_reply(node_id_t requester, page_id_t page_id, const void *data) {
+int send_page_reply(node_id_t requester, page_id_t page_id, access_type_t access, const void *data) {
     dsm_context_t *ctx = dsm_get_context();
     message_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -144,17 +168,21 @@ int send_page_reply(node_id_t requester, page_id_t page_id, const void *data) {
 
     msg.payload.page_reply.page_id = page_id;
     msg.payload.page_reply.version = 0;
+    msg.payload.page_reply.access = access;
     memcpy(msg.payload.page_reply.data, data, PAGE_SIZE);
 
-    LOG_DEBUG("Sending PAGE_REPLY for page %lu to node %u", page_id, requester);
+    LOG_DEBUG("Sending PAGE_REPLY for page %lu to node %u (access=%s)",
+              page_id, requester, access == ACCESS_READ ? "READ" : "WRITE");
     return network_send(requester, &msg);
 }
 
 int handle_page_reply(const message_t *msg) {
     page_id_t page_id = msg->payload.page_reply.page_id;
     uint64_t version = msg->payload.page_reply.version;
+    access_type_t access = msg->payload.page_reply.access;
 
-    LOG_DEBUG("Handling PAGE_REPLY for page %lu (version %lu)", page_id, version);
+    LOG_DEBUG("Handling PAGE_REPLY for page %lu (version %lu, access=%s)",
+              page_id, version, access == ACCESS_READ ? "READ" : "WRITE");
 
     dsm_context_t *ctx = dsm_get_context();
     if (ctx->num_allocations == 0) {
@@ -188,11 +216,22 @@ int handle_page_reply(const message_t *msg) {
     memcpy(entry->local_addr, msg->payload.page_reply.data, PAGE_SIZE);
     entry->version = version;
 
-    /* Set appropriate permission - will be set by fetch_page_read/write */
-    /* For now, conservatively set to READ_WRITE */
-    set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
+    /* Set appropriate permission based on requested access type
+     * This ensures coherence protocol correctness:
+     * - READ access -> READ_ONLY permission (PROT_READ)
+     * - WRITE access -> READ_WRITE permission (PROT_READ|PROT_WRITE)
+     */
+    page_perm_t permission = (access == ACCESS_READ) ? PAGE_PERM_READ : PAGE_PERM_READ_WRITE;
+    int rc = set_page_permission(entry->local_addr, permission);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to set page %lu permission to %s",
+                  page_id, permission == PAGE_PERM_READ ? "READ" : "READ_WRITE");
+        page_table_release(owning_table);
+        return rc;
+    }
 
-    LOG_DEBUG("Copied page %lu data and updated permissions", page_id);
+    LOG_DEBUG("Copied page %lu data and set permission to %s",
+              page_id, permission == PAGE_PERM_READ ? "READ" : "READ_WRITE");
 
     /* Signal waiting threads (Task 8.1: wake all queued requesters) */
     pthread_mutex_lock(&entry->entry_lock);
@@ -289,6 +328,16 @@ int handle_invalidate(const message_t *msg) {
     entry->state = PAGE_STATE_INVALID;
     entry->owner = new_owner;
     pthread_mutex_unlock(&owning_table->lock);
+
+    /* Update directory to reflect new owner
+     * This ensures all nodes maintain consistent ownership information
+     * Critical for coherence protocol correctness */
+    page_directory_t *dir = get_page_directory();
+    if (dir) {
+        directory_set_owner(dir, page_id, new_owner);
+        directory_remove_sharer(dir, page_id, ctx->node_id);
+        LOG_DEBUG("Updated directory: page %lu now owned by node %u", page_id, new_owner);
+    }
 
     LOG_DEBUG("Invalidated page %lu (state=INVALID, new_owner=%u)",
               page_id, new_owner);
@@ -596,7 +645,129 @@ int handle_alloc_notify(const message_t *msg) {
     LOG_INFO("SVAS setup complete: local addr=%p maps to remote pages %lu-%lu (owner=node %u)",
              addr, start_page_id, end_page_id, owner);
 
+    /* CRITICAL FIX #1: Send ALLOC_ACK to allocation owner after SVAS setup */
+    return send_alloc_ack(owner, start_page_id, end_page_id);
+}
+
+/* ALLOC_ACK */
+int send_alloc_ack(node_id_t target, page_id_t start_page_id, page_id_t end_page_id) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_ALLOC_ACK;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.alloc_ack.start_page_id = start_page_id;
+    msg.payload.alloc_ack.end_page_id = end_page_id;
+    msg.payload.alloc_ack.acker = ctx->node_id;
+
+    LOG_DEBUG("Sending ALLOC_ACK to node %u for pages %lu-%lu",
+              target, start_page_id, end_page_id);
+
+    return network_send(target, &msg);
+}
+
+int handle_alloc_ack(const message_t *msg) {
+    page_id_t start_page_id = msg->payload.alloc_ack.start_page_id;
+    page_id_t end_page_id = msg->payload.alloc_ack.end_page_id;
+    node_id_t acker = msg->payload.alloc_ack.acker;
+
+    LOG_DEBUG("Received ALLOC_ACK from node %u for pages %lu-%lu",
+              acker, start_page_id, end_page_id);
+
+    dsm_context_t *ctx = dsm_get_context();
+    alloc_ack_tracker_t *tracker = &ctx->network.alloc_tracker;
+
+    pthread_mutex_lock(&tracker->lock);
+
+    /* Check if we're tracking this allocation */
+    if (!tracker->active) {
+        pthread_mutex_unlock(&tracker->lock);
+        LOG_WARN("Received ALLOC_ACK but no allocation is being tracked");
+        return DSM_SUCCESS;
+    }
+
+    /* Verify this ACK matches the tracked allocation */
+    if (tracker->start_page_id != start_page_id ||
+        tracker->end_page_id != end_page_id) {
+        pthread_mutex_unlock(&tracker->lock);
+        LOG_WARN("ALLOC_ACK page range mismatch: expected %lu-%lu, got %lu-%lu",
+                 tracker->start_page_id, tracker->end_page_id,
+                 start_page_id, end_page_id);
+        return DSM_SUCCESS;
+    }
+
+    /* Mark this node as having ACK'd */
+    if (acker < MAX_NODES && !tracker->acks_received[acker]) {
+        tracker->acks_received[acker] = true;
+        tracker->received_acks++;
+        LOG_DEBUG("ALLOC_ACK received from node %u (%d/%d)",
+                  acker, tracker->received_acks, tracker->expected_acks);
+
+        /* If all ACKs received, signal waiting thread */
+        if (tracker->received_acks >= tracker->expected_acks) {
+            LOG_INFO("All %d ALLOC_ACKs received for pages %lu-%lu, signaling",
+                     tracker->expected_acks, start_page_id, end_page_id);
+            pthread_cond_signal(&tracker->all_acks_cv);
+        }
+    }
+
+    pthread_mutex_unlock(&tracker->lock);
     return DSM_SUCCESS;
+}
+
+int wait_for_alloc_acks(page_id_t start_page_id, page_id_t end_page_id,
+                        int expected_acks, int timeout_sec) {
+    if (expected_acks == 0) {
+        return DSM_SUCCESS;  /* No ACKs to wait for */
+    }
+
+    dsm_context_t *ctx = dsm_get_context();
+    alloc_ack_tracker_t *tracker = &ctx->network.alloc_tracker;
+
+    pthread_mutex_lock(&tracker->lock);
+
+    /* Initialize tracker */
+    tracker->start_page_id = start_page_id;
+    tracker->end_page_id = end_page_id;
+    tracker->expected_acks = expected_acks;
+    tracker->received_acks = 0;
+    tracker->active = true;
+    for (int i = 0; i < MAX_NODES; i++) {
+        tracker->acks_received[i] = false;
+    }
+
+    LOG_INFO("Waiting for %d ALLOC_ACKs for pages %lu-%lu (timeout=%ds)",
+             expected_acks, start_page_id, end_page_id, timeout_sec);
+
+    /* Wait for all ACKs with timeout */
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += timeout_sec;
+
+    int rc = DSM_SUCCESS;
+    while (tracker->received_acks < tracker->expected_acks) {
+        int wait_rc = pthread_cond_timedwait(&tracker->all_acks_cv,
+                                             &tracker->lock, &timeout);
+        if (wait_rc == ETIMEDOUT) {
+            LOG_ERROR("Timeout waiting for ALLOC_ACKs (received %d/%d)",
+                      tracker->received_acks, tracker->expected_acks);
+            rc = DSM_ERROR_TIMEOUT;
+            break;
+        }
+    }
+
+    /* Deactivate tracker */
+    tracker->active = false;
+    pthread_mutex_unlock(&tracker->lock);
+
+    if (rc == DSM_SUCCESS) {
+        LOG_INFO("Successfully received all %d ALLOC_ACKs", expected_acks);
+    }
+
+    return rc;
 }
 
 /* NODE_JOIN */
@@ -698,9 +869,154 @@ int send_heartbeat(node_id_t target) {
 }
 
 int handle_heartbeat(const message_t *msg) {
-    /* Heartbeat received - connection is alive, nothing more to do */
-    LOG_DEBUG("Received HEARTBEAT from node %u", msg->header.sender);
+    /* CRITICAL FIX #2: Update last_heartbeat_time to track node health */
+    dsm_context_t *ctx = dsm_get_context();
+    node_id_t sender = msg->header.sender;
+
+    LOG_DEBUG("Received HEARTBEAT from node %u", sender);
+
+    if (sender >= MAX_NODES) {
+        return DSM_ERROR_INVALID;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->network.nodes[sender].connected) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ctx->network.nodes[sender].last_heartbeat_time =
+            now.tv_sec * 1000000000ULL + now.tv_nsec;
+        ctx->network.nodes[sender].missed_heartbeats = 0;
+
+        /* If node was marked as failed, resurrect it */
+        if (ctx->network.nodes[sender].is_failed) {
+            LOG_INFO("Node %u has recovered (heartbeat received)", sender);
+            ctx->network.nodes[sender].is_failed = false;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
     return DSM_SUCCESS;
+}
+
+/* CRITICAL FIX #2: Heartbeat thread for failure detection */
+static void* heartbeat_thread_func(void *arg) {
+    (void)arg;
+    dsm_context_t *ctx = dsm_get_context();
+
+    const uint64_t HEARTBEAT_INTERVAL_NS = 2000000000ULL;  /* 2 seconds */
+    const uint64_t HEARTBEAT_TIMEOUT_NS = 6000000000ULL;   /* 6 seconds (3 missed) */
+    const int MAX_MISSED_HEARTBEATS = 3;
+
+    LOG_INFO("Heartbeat thread started (interval=2s, timeout=6s)");
+
+    while (ctx->network.running) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t current_time = now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+        pthread_mutex_lock(&ctx->lock);
+
+        /* Send heartbeats to all connected nodes */
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (ctx->network.nodes[i].connected &&
+                ctx->network.nodes[i].id != ctx->node_id &&
+                !ctx->network.nodes[i].is_failed) {
+
+                /* Send heartbeat */
+                node_id_t target = ctx->network.nodes[i].id;
+                pthread_mutex_unlock(&ctx->lock);  /* Release lock during send */
+                send_heartbeat(target);
+                pthread_mutex_lock(&ctx->lock);  /* Reacquire lock */
+            }
+        }
+
+        /* Check for failed nodes (nodes that haven't sent heartbeats) */
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (ctx->network.nodes[i].connected &&
+                ctx->network.nodes[i].id != ctx->node_id &&
+                !ctx->network.nodes[i].is_failed) {
+
+                uint64_t last_hb = ctx->network.nodes[i].last_heartbeat_time;
+
+                /* If this is the first heartbeat, initialize timestamp */
+                if (last_hb == 0) {
+                    ctx->network.nodes[i].last_heartbeat_time = current_time;
+                    continue;
+                }
+
+                uint64_t elapsed = current_time - last_hb;
+                if (elapsed > HEARTBEAT_TIMEOUT_NS) {
+                    ctx->network.nodes[i].missed_heartbeats++;
+
+                    if (ctx->network.nodes[i].missed_heartbeats >= MAX_MISSED_HEARTBEATS) {
+                        /* Mark node as failed */
+                        ctx->network.nodes[i].is_failed = true;
+                        node_id_t failed_node_id = ctx->network.nodes[i].id;
+                        LOG_ERROR("Node %u marked as FAILED (no heartbeat for %llu ms)",
+                                  failed_node_id, elapsed / 1000000);
+
+                        /* CRITICAL FIX: Trigger recovery - clean up directory entries */
+                        page_directory_t *dir = get_page_directory();
+                        if (dir) {
+                            /* Release lock during directory operation to avoid deadlock */
+                            pthread_mutex_unlock(&ctx->lock);
+                            directory_handle_node_failure(dir, failed_node_id);
+                            pthread_mutex_lock(&ctx->lock);
+                            /* Note: Need to recheck loop condition after reacquiring lock */
+                        }
+                    }
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&ctx->lock);
+
+        /* Sleep for heartbeat interval */
+        struct timespec sleep_time = {
+            .tv_sec = 2,
+            .tv_nsec = 0
+        };
+        nanosleep(&sleep_time, NULL);
+    }
+
+    LOG_INFO("Heartbeat thread stopped");
+    return NULL;
+}
+
+void start_heartbeat_thread(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Initialize all nodes' heartbeat timestamps */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t current_time = now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < MAX_NODES; i++) {
+        ctx->network.nodes[i].last_heartbeat_time = current_time;
+        ctx->network.nodes[i].missed_heartbeats = 0;
+        ctx->network.nodes[i].is_failed = false;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (pthread_create(&ctx->network.heartbeat_thread, NULL,
+                       heartbeat_thread_func, NULL) != 0) {
+        LOG_ERROR("Failed to create heartbeat thread");
+        return;
+    }
+
+    LOG_INFO("Heartbeat thread started");
+}
+
+void stop_heartbeat_thread(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    if (ctx->network.heartbeat_thread != 0) {
+        /* running flag is already set to false by network_shutdown */
+        pthread_join(ctx->network.heartbeat_thread, NULL);
+        ctx->network.heartbeat_thread = 0;
+        LOG_INFO("Heartbeat thread stopped");
+    }
 }
 
 /* Dispatcher */
@@ -726,10 +1042,15 @@ int dispatch_message(const message_t *msg, int sockfd) {
             return handle_barrier_release(msg);
         case MSG_ALLOC_NOTIFY:
             return handle_alloc_notify(msg);
+        case MSG_ALLOC_ACK:
+            return handle_alloc_ack(msg);
         case MSG_NODE_JOIN:
             return handle_node_join(msg, sockfd);
         case MSG_HEARTBEAT:
             return handle_heartbeat(msg);
+        case MSG_HEARTBEAT_ACK:
+            /* Optional, currently unused */
+            return DSM_SUCCESS;
         case MSG_NODE_LEAVE:
             LOG_INFO("Received NODE_LEAVE from node %u", msg->header.sender);
             return DSM_SUCCESS;

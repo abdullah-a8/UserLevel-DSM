@@ -111,21 +111,51 @@ void* dsm_malloc(size_t size) {
 
     LOG_INFO("dsm_malloc: allocated %zu pages at %p", num_pages, addr);
 
-    /* Broadcast allocation to all other nodes for SVAS */
+    /* CRITICAL FIX #1 & BUG FIX (BUG 3): Broadcast allocation and wait for ACKs
+     * Must serialize this entire section with allocation_lock to prevent concurrent
+     * allocations from corrupting the shared alloc_tracker state */
     if (ctx->config.num_nodes > 1) {
+        /* BUG FIX (BUG 3): Acquire allocation lock to serialize use of alloc_tracker */
+        pthread_mutex_lock(&ctx->allocation_lock);
+
         page_id_t start_page_id = new_table->start_page_id;
         page_id_t end_page_id = start_page_id + num_pages - 1;
 
-        LOG_INFO("Broadcasting SVAS allocation: pages %lu-%lu at addr=%p, size=%zu (owner=node %u)",
-                 start_page_id, end_page_id, addr, aligned_size, ctx->node_id);
+        /* Count connected nodes (excluding self) */
+        int expected_acks = 0;
+        pthread_mutex_lock(&ctx->lock);
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (ctx->network.nodes[i].connected &&
+                ctx->network.nodes[i].id != ctx->node_id &&
+                !ctx->network.nodes[i].is_failed) {
+                expected_acks++;
+            }
+        }
+        pthread_mutex_unlock(&ctx->lock);
+
+        LOG_INFO("Broadcasting SVAS allocation: pages %lu-%lu at addr=%p, size=%zu (owner=node %u, expecting %d ACKs)",
+                 start_page_id, end_page_id, addr, aligned_size, ctx->node_id, expected_acks);
 
         int rc = send_alloc_notify(start_page_id, end_page_id, ctx->node_id, num_pages, addr, aligned_size);
         if (rc != DSM_SUCCESS) {
             LOG_WARN("Failed to broadcast allocation notification");
+            pthread_mutex_unlock(&ctx->allocation_lock);  /* BUG FIX: Release lock before return */
+            /* Don't fail allocation, but don't wait for ACKs */
+            return addr;
         }
 
-        /* Give other nodes time to create SVAS mapping */
-        usleep(100000);  /* 100ms - increased for SVAS setup */
+        /* Wait for all nodes to ACK the allocation (with 10 second timeout)
+         * This uses the shared alloc_tracker, which is now protected by allocation_lock */
+        if (expected_acks > 0) {
+            rc = wait_for_alloc_acks(start_page_id, end_page_id, expected_acks, 10);
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("Failed to receive all ALLOC_ACKs, but allocation proceeds");
+                /* Don't fail the allocation - system will recover via lazy propagation */
+            }
+        }
+
+        /* BUG FIX (BUG 3): Release allocation lock after tracker is done */
+        pthread_mutex_unlock(&ctx->allocation_lock);
     }
 
     return addr;
@@ -163,6 +193,19 @@ int dsm_free(void *ptr) {
     }
 
     size_t size = target_table->total_size;
+    page_id_t start_page_id = target_table->start_page_id;
+    size_t num_pages = target_table->num_pages;
+
+    /* Clean up directory entries for all pages in this allocation
+     * This prevents memory leak in the directory */
+    page_directory_t *dir = get_page_directory();
+    if (dir) {
+        for (size_t i = 0; i < num_pages; i++) {
+            page_id_t page_id = start_page_id + i;
+            directory_remove_entry(dir, page_id);
+        }
+        LOG_DEBUG("Removed %zu directory entries for freed allocation", num_pages);
+    }
 
     /* Remove from list and compact - this prevents new references from being acquired */
     for (int i = target_index; i < ctx->num_allocations - 1; i++) {
@@ -190,6 +233,7 @@ int dsm_free(void *ptr) {
         return DSM_ERROR_MEMORY;
     }
 
-    LOG_INFO("dsm_free: freed %zu bytes at %p", size, ptr);
+    LOG_INFO("dsm_free: freed %zu bytes at %p (%zu directory entries cleaned)",
+             size, ptr, num_pages);
     return DSM_SUCCESS;
 }

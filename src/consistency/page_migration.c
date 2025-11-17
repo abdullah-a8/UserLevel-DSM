@@ -108,7 +108,7 @@ int fetch_page_read(page_id_t page_id) {
         while (entry->request_pending) {
             rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
             if (rc != 0) {
-                LOG_ERROR("Timeout waiting for page %lu", page_id);
+                LOG_ERROR("Timeout waiting for page %lu (queued thread)", page_id);
                 entry->num_waiting_threads--;
                 pthread_mutex_unlock(&entry->entry_lock);
                 perf_log_timeout();  /* Task 8.6 */
@@ -117,9 +117,18 @@ int fetch_page_read(page_id_t page_id) {
         }
 
         entry->num_waiting_threads--;
+
+        /* CRITICAL FIX (BUG 1): Check fetch result before returning
+         * The primary thread sets fetch_result to indicate success or failure
+         * Waiting threads MUST check this before assuming the page is valid */
+        int result = entry->fetch_result;
         pthread_mutex_unlock(&entry->entry_lock);
 
-        /* Page should now be available */
+        if (result != DSM_SUCCESS) {
+            LOG_ERROR("Page %lu fetch failed in primary thread (result=%d)", page_id, result);
+            return result;  /* Propagate error from primary thread */
+        }
+
         LOG_DEBUG("Page %lu now available after queued wait", page_id);
         return DSM_SUCCESS;
     }
@@ -133,6 +142,7 @@ int fetch_page_read(page_id_t page_id) {
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to send PAGE_REQUEST to node %u", owner);
         pthread_mutex_lock(&entry->entry_lock);
+        entry->fetch_result = rc;  /* BUG FIX: Set result before waking waiters */
         entry->request_pending = false;
         pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters */
         pthread_mutex_unlock(&entry->entry_lock);
@@ -148,18 +158,74 @@ int fetch_page_read(page_id_t page_id) {
     while (entry->request_pending) {
         rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
         if (rc != 0) {
-            LOG_ERROR("Timeout waiting for page %lu", page_id);
+            LOG_ERROR("Timeout waiting for page %lu from node %u", page_id, owner);
+
+            /* CRITICAL FIX: Check if owner has failed and attempt recovery
+             * If owner is dead, we can reclaim ownership and treat page as new */
+            bool owner_failed = false;
+            pthread_mutex_lock(&ctx->lock);
+            if (owner < MAX_NODES && ctx->network.nodes[owner].is_failed) {
+                owner_failed = true;
+            }
+            pthread_mutex_unlock(&ctx->lock);
+
+            if (owner_failed) {
+                LOG_WARN("Page %lu owner (node %u) has failed - reclaiming ownership for READ",
+                         page_id, owner);
+
+                /* Reclaim ownership in directory */
+                directory_reclaim_ownership(g_directory, page_id, ctx->node_id);
+
+                /* Initialize page with zeros (data lost from failed node) */
+                memset(entry->local_addr, 0, PAGE_SIZE);
+
+                /* Set permission to READ */
+                rc = set_page_permission(entry->local_addr, PAGE_PERM_READ);
+                if (rc != DSM_SUCCESS) {
+                    LOG_ERROR("Failed to set page permission after recovery");
+                    /* BUG FIX: Set error result before waking waiters */
+                    entry->fetch_result = rc;
+                    entry->request_pending = false;
+                    pthread_cond_broadcast(&entry->ready_cv);
+                    pthread_mutex_unlock(&entry->entry_lock);
+                    return rc;
+                }
+
+                entry->state = PAGE_STATE_READ_ONLY;
+                entry->owner = ctx->node_id;
+
+                /* BUG FIX: Set success result for recovery before waking waiters */
+                entry->fetch_result = DSM_SUCCESS;
+                entry->request_pending = false;
+                pthread_cond_broadcast(&entry->ready_cv);
+                pthread_mutex_unlock(&entry->entry_lock);
+
+                LOG_INFO("Successfully recovered page %lu from failed node %u", page_id, owner);
+                return DSM_SUCCESS;  /* Recovery successful */
+            }
+
+            /* BUG FIX (BUG 1): Set timeout error BEFORE clearing request_pending
+             * This ensures waiting threads see the error instead of incorrectly assuming success */
+            entry->fetch_result = DSM_ERROR_TIMEOUT;
             entry->request_pending = false;
-            pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters */
+            pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters with error */
             pthread_mutex_unlock(&entry->entry_lock);
             perf_log_timeout();  /* Task 8.6 */
+
             return DSM_ERROR_TIMEOUT;
         }
     }
+
+    /* BUG FIX: Set success result when page arrives successfully */
+    entry->fetch_result = DSM_SUCCESS;
     pthread_mutex_unlock(&entry->entry_lock);
 
     /* Update directory: add self as sharer */
-    directory_add_reader(g_directory, page_id, ctx->node_id);
+    rc = directory_add_reader(g_directory, page_id, ctx->node_id);
+    if (rc != DSM_SUCCESS && rc != DSM_ERROR_BUSY) {
+        LOG_ERROR("Failed to add reader to directory for page %lu", page_id);
+        return rc;
+    }
 
     /* Update local state */
     entry->state = PAGE_STATE_READ_ONLY;
@@ -224,7 +290,7 @@ int fetch_page_write(page_id_t page_id) {
         while (entry->request_pending) {
             rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
             if (rc != 0) {
-                LOG_ERROR("Timeout waiting for page %lu (write)", page_id);
+                LOG_ERROR("Timeout waiting for page %lu (write, queued thread)", page_id);
                 entry->num_waiting_threads--;
                 pthread_mutex_unlock(&entry->entry_lock);
                 perf_log_timeout();  /* Task 8.6 */
@@ -233,9 +299,18 @@ int fetch_page_write(page_id_t page_id) {
         }
 
         entry->num_waiting_threads--;
+
+        /* CRITICAL FIX (BUG 2): Check fetch result before returning
+         * The primary thread sets fetch_result to indicate success or failure
+         * Waiting threads MUST check this before assuming the page is valid */
+        int result = entry->fetch_result;
         pthread_mutex_unlock(&entry->entry_lock);
 
-        /* Page should now be available */
+        if (result != DSM_SUCCESS) {
+            LOG_ERROR("Page %lu write fetch failed in primary thread (result=%d)", page_id, result);
+            return result;  /* Propagate error from primary thread */
+        }
+
         LOG_DEBUG("Page %lu now available after queued write wait", page_id);
         return DSM_SUCCESS;
     }
@@ -244,7 +319,10 @@ int fetch_page_write(page_id_t page_id) {
     entry->request_pending = true;
     pthread_mutex_unlock(&entry->entry_lock);
 
-    /* Get list of nodes to invalidate */
+    /* PERFORMANCE NOTE: Get list of nodes to invalidate and set ourselves as owner
+     * This creates a small window where directory shows us as owner before page is valid
+     * handle_page_request checks page state and returns error if INVALID, causing retry
+     * This is correct but not optimal - future optimization could delay owner update */
     node_id_t invalidate_list[MAX_SHARERS];
     int num_invalidate = 0;
     rc = directory_set_writer(g_directory, page_id, ctx->node_id,
@@ -252,6 +330,7 @@ int fetch_page_write(page_id_t page_id) {
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to update directory for page %lu", page_id);
         pthread_mutex_lock(&entry->entry_lock);
+        entry->fetch_result = rc;  /* BUG FIX: Set result before waking waiters */
         entry->request_pending = false;
         pthread_cond_broadcast(&entry->ready_cv);
         pthread_mutex_unlock(&entry->entry_lock);
@@ -263,13 +342,33 @@ int fetch_page_write(page_id_t page_id) {
     entry->pending_inv_acks = num_invalidate;
     pthread_mutex_unlock(&entry->entry_lock);
 
-    /* Send invalidations to all sharers */
+    /* CRITICAL FIX #3: Send invalidations to all sharers (skip failed nodes) */
     for (int i = 0; i < num_invalidate; i++) {
+        node_id_t target = invalidate_list[i];
+
+        /* Skip failed nodes */
+        bool is_failed = false;
+        pthread_mutex_lock(&ctx->lock);
+        if (target < MAX_NODES && ctx->network.nodes[target].is_failed) {
+            is_failed = true;
+            LOG_WARN("Skipping invalidation to failed node %u for page %lu",
+                     target, page_id);
+        }
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (is_failed) {
+            /* Decrement pending count for failed node */
+            pthread_mutex_lock(&entry->entry_lock);
+            entry->pending_inv_acks--;
+            pthread_mutex_unlock(&entry->entry_lock);
+            continue;
+        }
+
         LOG_DEBUG("Sending invalidation for page %lu to node %u",
-                  page_id, invalidate_list[i]);
-        rc = send_invalidate(invalidate_list[i], page_id);
+                  page_id, target);
+        rc = send_invalidate(target, page_id);
         if (rc != DSM_SUCCESS) {
-            LOG_WARN("Failed to send invalidation to node %u", invalidate_list[i]);
+            LOG_WARN("Failed to send invalidation to node %u", target);
             /* Decrement pending count if send failed */
             pthread_mutex_lock(&entry->entry_lock);
             entry->pending_inv_acks--;
@@ -302,6 +401,10 @@ int fetch_page_write(page_id_t page_id) {
         LOG_DEBUG("Received all invalidation ACKs for page %lu", page_id);
     }
 
+    /* All invalidations complete - now safe to clear sharers
+     * This prevents race where new readers could be added before invalidations complete */
+    directory_clear_sharers(g_directory, page_id);
+
     /* If we were not the owner, request page data */
     if (owner != ctx->node_id) {
         /* Send PAGE_REQUEST with WRITE access */
@@ -309,6 +412,7 @@ int fetch_page_write(page_id_t page_id) {
         if (rc != DSM_SUCCESS) {
             LOG_ERROR("Failed to send PAGE_REQUEST to node %u", owner);
             pthread_mutex_lock(&entry->entry_lock);
+            entry->fetch_result = rc;  /* BUG FIX: Set result before waking waiters */
             entry->request_pending = false;
             pthread_cond_broadcast(&entry->ready_cv);
             pthread_mutex_unlock(&entry->entry_lock);
@@ -324,14 +428,67 @@ int fetch_page_write(page_id_t page_id) {
         while (entry->request_pending) {
             rc = pthread_cond_timedwait(&entry->ready_cv, &entry->entry_lock, &timeout);
             if (rc != 0) {
-                LOG_ERROR("Timeout waiting for page %lu", page_id);
+                LOG_ERROR("Timeout waiting for page %lu from node %u (WRITE)", page_id, owner);
+
+                /* CRITICAL FIX: Check if owner has failed and attempt recovery
+                 * If owner is dead, we can reclaim ownership with WRITE access */
+                bool owner_failed = false;
+                pthread_mutex_lock(&ctx->lock);
+                if (owner < MAX_NODES && ctx->network.nodes[owner].is_failed) {
+                    owner_failed = true;
+                }
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (owner_failed) {
+                    LOG_WARN("Page %lu owner (node %u) has failed - reclaiming ownership for WRITE",
+                             page_id, owner);
+
+                    /* Reclaim ownership in directory (already done above, but ensure) */
+                    directory_reclaim_ownership(g_directory, page_id, ctx->node_id);
+
+                    /* Initialize page with zeros (data lost from failed node) */
+                    memset(entry->local_addr, 0, PAGE_SIZE);
+
+                    /* Set permission to READ_WRITE */
+                    rc = set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
+                    if (rc != DSM_SUCCESS) {
+                        LOG_ERROR("Failed to set page permission after recovery");
+                        /* BUG FIX: Set error result before waking waiters */
+                        entry->fetch_result = rc;
+                        entry->request_pending = false;
+                        pthread_cond_broadcast(&entry->ready_cv);
+                        pthread_mutex_unlock(&entry->entry_lock);
+                        return rc;
+                    }
+
+                    entry->state = PAGE_STATE_READ_WRITE;
+                    entry->owner = ctx->node_id;
+
+                    /* BUG FIX: Set success result for recovery before waking waiters */
+                    entry->fetch_result = DSM_SUCCESS;
+                    entry->request_pending = false;
+                    pthread_cond_broadcast(&entry->ready_cv);
+                    pthread_mutex_unlock(&entry->entry_lock);
+
+                    LOG_INFO("Successfully recovered page %lu from failed node %u (WRITE)",
+                             page_id, owner);
+                    return DSM_SUCCESS;  /* Recovery successful */
+                }
+
+                /* BUG FIX (BUG 2): Set timeout error BEFORE clearing request_pending
+                 * This ensures waiting threads see the error instead of incorrectly assuming success */
+                entry->fetch_result = DSM_ERROR_TIMEOUT;
                 entry->request_pending = false;
-                pthread_cond_broadcast(&entry->ready_cv);
+                pthread_cond_broadcast(&entry->ready_cv);  /* Wake any waiters with error */
                 pthread_mutex_unlock(&entry->entry_lock);
                 perf_log_timeout();  /* Task 8.6 */
+
                 return DSM_ERROR_TIMEOUT;
             }
         }
+
+        /* BUG FIX: Set success result when page arrives successfully */
+        entry->fetch_result = DSM_SUCCESS;
         pthread_mutex_unlock(&entry->entry_lock);
 
         /* Update stats */
@@ -343,14 +500,16 @@ int fetch_page_write(page_id_t page_id) {
         rc = set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
         if (rc != DSM_SUCCESS) {
             pthread_mutex_lock(&entry->entry_lock);
+            entry->fetch_result = rc;  /* BUG FIX: Set error result before waking waiters */
             entry->request_pending = false;
             pthread_cond_broadcast(&entry->ready_cv);
             pthread_mutex_unlock(&entry->entry_lock);
             return rc;
         }
 
-        /* Clear request pending flag */
+        /* Clear request pending flag with success result */
         pthread_mutex_lock(&entry->entry_lock);
+        entry->fetch_result = DSM_SUCCESS;  /* BUG FIX: Set success result */
         entry->request_pending = false;
         pthread_cond_broadcast(&entry->ready_cv);
         pthread_mutex_unlock(&entry->entry_lock);
