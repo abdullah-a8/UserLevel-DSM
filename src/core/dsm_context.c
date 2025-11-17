@@ -46,10 +46,13 @@ int dsm_context_init(const dsm_config_t *config) {
     ctx->network.running = false;
     ctx->network.dispatcher_thread = 0;
     ctx->network.send_queue = msg_queue_create();
+    ctx->network.num_pending = 0;
+    pthread_mutex_init(&ctx->network.pending_lock, NULL);
 
     for (int i = 0; i < MAX_NODES; i++) {
         ctx->network.nodes[i].connected = false;
         ctx->network.nodes[i].sockfd = -1;
+        ctx->network.pending_sockets[i] = -1;
     }
 
     /* Initialize lock manager */
@@ -103,6 +106,16 @@ void dsm_context_cleanup(void) {
             close(ctx->network.nodes[i].sockfd);
         }
     }
+
+    /* Close pending connections */
+    pthread_mutex_lock(&ctx->network.pending_lock);
+    for (int i = 0; i < ctx->network.num_pending; i++) {
+        if (ctx->network.pending_sockets[i] >= 0) {
+            close(ctx->network.pending_sockets[i]);
+        }
+    }
+    pthread_mutex_unlock(&ctx->network.pending_lock);
+    pthread_mutex_destroy(&ctx->network.pending_lock);
 
     if (ctx->network.server_sockfd >= 0) {
         close(ctx->network.server_sockfd);

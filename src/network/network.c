@@ -107,12 +107,17 @@ static void* accept_thread(void *arg) {
                  ntohs(client_addr.sin_port),
                  client_fd);
 
-        /* NOTE: Do NOT assign node_id here!
-         * The connecting node will send MSG_NODE_JOIN with its node_id,
-         * which will be handled by handle_node_join() to properly map
-         * the socket to the correct node_id.
-         * This solves the critical bug where connections were stored
-         * in the wrong slot (first available vs actual node_id). */
+        /* Add to pending connections list - will be moved to nodes[] when NODE_JOIN is received */
+        pthread_mutex_lock(&ctx->network.pending_lock);
+        if (ctx->network.num_pending < MAX_NODES) {
+            ctx->network.pending_sockets[ctx->network.num_pending++] = client_fd;
+            LOG_DEBUG("Added sockfd=%d to pending connections (total pending=%d)",
+                     client_fd, ctx->network.num_pending);
+        } else {
+            LOG_ERROR("Too many pending connections, rejecting sockfd=%d", client_fd);
+            close(client_fd);
+        }
+        pthread_mutex_unlock(&ctx->network.pending_lock);
     }
 
     return NULL;
@@ -392,9 +397,10 @@ static void* dispatcher_thread(void *arg) {
     dsm_context_t *ctx = dsm_get_context();
 
     while (ctx->network.running) {
-        struct pollfd fds[MAX_NODES];
+        struct pollfd fds[MAX_NODES * 2];  /* Connected + pending */
         int nfds = 0;
 
+        /* Add connected nodes */
         pthread_mutex_lock(&ctx->lock);
         for (int i = 0; i < MAX_NODES; i++) {
             if (ctx->network.nodes[i].connected) {
@@ -404,6 +410,15 @@ static void* dispatcher_thread(void *arg) {
             }
         }
         pthread_mutex_unlock(&ctx->lock);
+
+        /* Add pending connections (waiting for NODE_JOIN) */
+        pthread_mutex_lock(&ctx->network.pending_lock);
+        for (int i = 0; i < ctx->network.num_pending; i++) {
+            fds[nfds].fd = ctx->network.pending_sockets[i];
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+        pthread_mutex_unlock(&ctx->network.pending_lock);
 
         if (nfds == 0) {
             usleep(100000);

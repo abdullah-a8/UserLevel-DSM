@@ -637,6 +637,22 @@ int handle_node_join(const message_t *msg, int sockfd) {
         return DSM_ERROR_INVALID;
     }
 
+    /* Remove from pending connections list */
+    pthread_mutex_lock(&ctx->network.pending_lock);
+    for (int i = 0; i < ctx->network.num_pending; i++) {
+        if (ctx->network.pending_sockets[i] == sockfd) {
+            /* Remove by shifting remaining elements */
+            for (int j = i; j < ctx->network.num_pending - 1; j++) {
+                ctx->network.pending_sockets[j] = ctx->network.pending_sockets[j + 1];
+            }
+            ctx->network.num_pending--;
+            LOG_DEBUG("Removed sockfd=%d from pending (remaining=%d)",
+                     sockfd, ctx->network.num_pending);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->network.pending_lock);
+
     pthread_mutex_lock(&ctx->lock);
 
     /* Check if this node is already connected */

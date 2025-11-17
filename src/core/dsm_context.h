@@ -36,6 +36,11 @@ typedef struct {
     pthread_t dispatcher_thread;
     msg_queue_t *send_queue;
     bool running;
+
+    /* Pending connections (not yet identified with NODE_JOIN) */
+    int pending_sockets[MAX_NODES];
+    int num_pending;
+    pthread_mutex_t pending_lock;
 } network_state_t;
 
 /**
