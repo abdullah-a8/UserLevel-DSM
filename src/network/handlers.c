@@ -847,6 +847,13 @@ int handle_node_join(const message_t *msg, int sockfd) {
         strncpy(ctx->network.nodes[joining_node_id].hostname, hostname, MAX_HOSTNAME_LEN - 1);
     }
 
+    /* CRITICAL FIX: Initialize heartbeat timestamp to prevent immediate failure detection */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ctx->network.nodes[joining_node_id].last_heartbeat_time = now.tv_sec * 1000000000ULL + now.tv_nsec;
+    ctx->network.nodes[joining_node_id].missed_heartbeats = 0;
+    ctx->network.nodes[joining_node_id].is_failed = false;
+
     pthread_mutex_unlock(&ctx->lock);
 
     LOG_INFO("Node %u successfully joined (sockfd=%d, total_nodes=%d)",
