@@ -89,6 +89,7 @@ int dsm_context_init(const dsm_config_t *config) {
     /* Page table will be initialized when first DSM memory is allocated */
     ctx->page_table = NULL;
     ctx->num_allocations = 0;
+    ctx->num_local_allocations = 0;  /* CRITICAL FIX: Initialize local allocation counter */
     for (int i = 0; i < 32; i++) {
         ctx->page_tables[i] = NULL;
     }

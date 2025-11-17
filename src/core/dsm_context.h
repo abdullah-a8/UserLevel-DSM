@@ -90,7 +90,8 @@ typedef struct {
     /* Memory management */
     page_table_t *page_table;  /* Primary page table (for backward compatibility) */
     page_table_t *page_tables[32];  /* Support up to 32 separate allocations */
-    int num_allocations;
+    int num_allocations;  /* Total allocations (local + remote) */
+    int num_local_allocations;  /* CRITICAL: Track only LOCAL allocations for allocation_index calculation */
     pthread_mutex_t allocation_lock;  /* BUG FIX (BUG 3): Serialize allocations to prevent tracker corruption */
 
     /* Network */

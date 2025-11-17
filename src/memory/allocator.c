@@ -52,7 +52,9 @@ void* dsm_malloc(size_t size) {
         return NULL;
     }
 
-    page_table_t *new_table = page_table_create(addr, aligned_size, ctx->node_id, ctx->num_allocations);
+    /* CRITICAL FIX: Use num_local_allocations for allocation_index to prevent
+     * remote allocations from corrupting local page ID assignment */
+    page_table_t *new_table = page_table_create(addr, aligned_size, ctx->node_id, ctx->num_local_allocations);
     if (!new_table) {
         pthread_mutex_unlock(&ctx->lock);
         munmap(addr, aligned_size);
@@ -63,6 +65,7 @@ void* dsm_malloc(size_t size) {
     /* Add to list of page tables */
     ctx->page_tables[ctx->num_allocations] = new_table;
     ctx->num_allocations++;
+    ctx->num_local_allocations++;  /* CRITICAL FIX: Increment local allocation counter */
 
     /* Set primary page table for backward compatibility */
     if (ctx->page_table == NULL) {
@@ -196,6 +199,12 @@ int dsm_free(void *ptr) {
     page_id_t start_page_id = target_table->start_page_id;
     size_t num_pages = target_table->num_pages;
 
+    /* CRITICAL FIX: Determine if this is a local allocation by checking page ID range
+     * Local allocations have page IDs in range [node_id * 1000000, (node_id + 1) * 1000000) */
+    page_id_t local_page_start = (page_id_t)ctx->node_id * 1000000;
+    page_id_t local_page_end = ((page_id_t)ctx->node_id + 1) * 1000000;
+    bool is_local_allocation = (start_page_id >= local_page_start && start_page_id < local_page_end);
+
     /* Clean up directory entries for all pages in this allocation
      * This prevents memory leak in the directory */
     page_directory_t *dir = get_page_directory();
@@ -213,6 +222,11 @@ int dsm_free(void *ptr) {
     }
     ctx->page_tables[ctx->num_allocations - 1] = NULL;
     ctx->num_allocations--;
+
+    /* CRITICAL FIX: Only decrement local allocation counter for local allocations */
+    if (is_local_allocation && ctx->num_local_allocations > 0) {
+        ctx->num_local_allocations--;
+    }
 
     /* Update primary page table reference */
     if (ctx->num_allocations > 0) {
