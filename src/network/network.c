@@ -165,6 +165,10 @@ int network_connect_to_node(node_id_t node_id, const char *hostname, uint16_t po
     ctx->network.nodes[node_id].id = node_id;
     ctx->network.nodes[node_id].port = port;
     strncpy(ctx->network.nodes[node_id].hostname, hostname, MAX_HOSTNAME_LEN - 1);
+
+    /* CRITICAL FIX: Set running flag so heartbeat thread stays alive on worker nodes */
+    ctx->network.running = true;
+
     pthread_mutex_unlock(&ctx->lock);
 
     LOG_INFO("Connected to node %u at %s:%u", node_id, hostname, port);
