@@ -324,12 +324,27 @@ int network_send(node_id_t dest, message_t *msg) {
     int sockfd = ctx->network.nodes[dest].sockfd;
     pthread_mutex_unlock(&ctx->lock);
 
-    /* Serialize */
-    uint8_t buffer[8192];
-    size_t len;
-    if (serialize_message(msg, buffer, &len) != DSM_SUCCESS) {
+    /* Serialize message to get payload */
+    uint8_t msg_buffer[8192];
+    size_t msg_len;
+    if (serialize_message(msg, msg_buffer, &msg_len) != DSM_SUCCESS) {
         return DSM_ERROR_INVALID;
     }
+
+    /* CRITICAL FIX: Add length prefix for proper TCP message framing
+     * This prevents message boundary loss when multiple messages arrive together */
+    uint8_t buffer[8196];  /* 4 bytes for length + 8192 for message */
+    uint32_t length_prefix = (uint32_t)msg_len;
+
+    /* Write length prefix (network byte order) */
+    buffer[0] = (length_prefix >> 24) & 0xFF;
+    buffer[1] = (length_prefix >> 16) & 0xFF;
+    buffer[2] = (length_prefix >> 8) & 0xFF;
+    buffer[3] = length_prefix & 0xFF;
+
+    /* Copy message after length prefix */
+    memcpy(buffer + 4, msg_buffer, msg_len);
+    size_t len = msg_len + 4;  /* Total: 4-byte prefix + message */
 
     /* Task 8.4: Network failure handling with retries */
     const int MAX_RETRIES = 3;
@@ -405,18 +420,55 @@ int network_recv(int sockfd, message_t *msg) {
         return DSM_ERROR_INVALID;
     }
 
-    uint8_t buffer[8192];
-    ssize_t received = recv(sockfd, buffer, sizeof(buffer), 0);
-    if (received <= 0) {
-        if (received == 0) {
-            LOG_INFO("Connection closed");
-        } else {
-            LOG_ERROR("Recv failed: %s", strerror(errno));
+    /* CRITICAL FIX: Read length prefix first (4 bytes, network byte order)
+     * This ensures we read exactly one complete message, handling TCP streaming correctly */
+    uint8_t length_buf[4];
+    size_t total_read = 0;
+
+    /* Read exactly 4 bytes for length prefix */
+    while (total_read < 4) {
+        ssize_t n = recv(sockfd, length_buf + total_read, 4 - total_read, 0);
+        if (n <= 0) {
+            if (n == 0) {
+                LOG_INFO("Connection closed");
+            } else {
+                LOG_ERROR("Recv failed reading length: %s", strerror(errno));
+            }
+            return DSM_ERROR_NETWORK;
         }
-        return DSM_ERROR_NETWORK;
+        total_read += n;
     }
 
-    return deserialize_message(buffer, received, msg);
+    /* Decode length (network byte order to host) */
+    uint32_t msg_len = ((uint32_t)length_buf[0] << 24) |
+                       ((uint32_t)length_buf[1] << 16) |
+                       ((uint32_t)length_buf[2] << 8) |
+                       ((uint32_t)length_buf[3]);
+
+    /* Validate message length */
+    if (msg_len == 0 || msg_len > 8192) {
+        LOG_ERROR("Invalid message length: %u", msg_len);
+        return DSM_ERROR_INVALID;
+    }
+
+    /* Read exactly msg_len bytes for the message payload */
+    uint8_t buffer[8192];
+    total_read = 0;
+
+    while (total_read < msg_len) {
+        ssize_t n = recv(sockfd, buffer + total_read, msg_len - total_read, 0);
+        if (n <= 0) {
+            if (n == 0) {
+                LOG_INFO("Connection closed while reading message");
+            } else {
+                LOG_ERROR("Recv failed reading message: %s", strerror(errno));
+            }
+            return DSM_ERROR_NETWORK;
+        }
+        total_read += n;
+    }
+
+    return deserialize_message(buffer, msg_len, msg);
 }
 
 int network_start_dispatcher(void) {
