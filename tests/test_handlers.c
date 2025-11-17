@@ -120,7 +120,7 @@ int test_message_dispatch() {
     msg.payload.lock_grant.lock_id = 1;
     msg.payload.lock_grant.grantee = 0;
 
-    int rc = dispatch_message(&msg);
+    int rc = dispatch_message(&msg, 0);  /* sockfd=0 for testing */
 
     dsm_lock_destroy(lock);
     dsm_finalize();
@@ -157,7 +157,7 @@ int test_lock_handlers() {
     msg.payload.lock_release.lock_id = 5;
     msg.payload.lock_release.releaser = 2;
 
-    int rc = dispatch_message(&msg);
+    int rc = dispatch_message(&msg, 0);  /* sockfd=0 for testing */
 
     dsm_lock_destroy(lock);
     dsm_finalize();
@@ -183,7 +183,7 @@ int test_barrier_handlers() {
     msg.payload.barrier_arrive.arriver = 0;
     msg.payload.barrier_arrive.num_participants = 4;
 
-    int rc = dispatch_message(&msg);
+    int rc = dispatch_message(&msg, 0);  /* sockfd=0 for testing */
 
     dsm_finalize();
     return rc == DSM_SUCCESS ? 1 : 0;

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* PAGE_REQUEST */
 int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) {
@@ -299,7 +300,43 @@ int handle_invalidate(const message_t *msg) {
 
 int handle_invalidate_ack(const message_t *msg) {
     page_id_t page_id = msg->payload.invalidate_ack.page_id;
-    LOG_DEBUG("Received INVALIDATE_ACK for page %lu", page_id);
+    node_id_t acker = msg->payload.invalidate_ack.acker;
+
+    LOG_DEBUG("Received INVALIDATE_ACK for page %lu from node %u", page_id, acker);
+
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Find the page entry to decrement pending ACK counter */
+    page_entry_t *entry = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->num_allocations; i++) {
+        if (ctx->page_tables[i]) {
+            entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+            if (entry) break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (!entry) {
+        LOG_WARN("Received INVALIDATE_ACK for unknown page %lu", page_id);
+        return DSM_SUCCESS;
+    }
+
+    /* Decrement pending ACK counter and signal if all ACKs received */
+    pthread_mutex_lock(&entry->entry_lock);
+    if (entry->pending_inv_acks > 0) {
+        entry->pending_inv_acks--;
+        LOG_DEBUG("Page %lu: pending_inv_acks decremented to %d",
+                  page_id, entry->pending_inv_acks);
+
+        if (entry->pending_inv_acks == 0) {
+            /* All ACKs received, wake up waiting thread */
+            pthread_cond_signal(&entry->inv_ack_cv);
+            LOG_DEBUG("All invalidation ACKs received for page %lu, signaling", page_id);
+        }
+    }
+    pthread_mutex_unlock(&entry->entry_lock);
+
     return DSM_SUCCESS;
 }
 
@@ -562,8 +599,96 @@ int handle_alloc_notify(const message_t *msg) {
     return DSM_SUCCESS;
 }
 
+/* NODE_JOIN */
+int send_node_join(node_id_t node_id, const char *hostname, uint16_t port) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_NODE_JOIN;
+    msg.header.sender = node_id;
+
+    msg.payload.node_join.node_id = node_id;
+    msg.payload.node_join.port = port;
+    if (hostname) {
+        strncpy(msg.payload.node_join.hostname, hostname, MAX_HOSTNAME_LEN - 1);
+    }
+
+    LOG_INFO("Sending NODE_JOIN to manager (node_id=%u, port=%u)", node_id, port);
+
+    /* Send to manager (node 0) */
+    return network_send(0, &msg);
+}
+
+int handle_node_join(const message_t *msg, int sockfd) {
+    node_id_t joining_node_id = msg->payload.node_join.node_id;
+    uint16_t port = msg->payload.node_join.port;
+    const char *hostname = msg->payload.node_join.hostname;
+
+    LOG_INFO("Handling NODE_JOIN from node %u (port=%u, hostname=%s, sockfd=%d)",
+             joining_node_id, port, hostname, sockfd);
+
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Validate node_id */
+    if (joining_node_id >= MAX_NODES) {
+        LOG_ERROR("Invalid node_id %u (max=%d)", joining_node_id, MAX_NODES);
+        return DSM_ERROR_INVALID;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    /* Check if this node is already connected */
+    if (ctx->network.nodes[joining_node_id].connected) {
+        LOG_WARN("Node %u already connected, updating connection", joining_node_id);
+        /* Close old socket if different */
+        if (ctx->network.nodes[joining_node_id].sockfd != sockfd &&
+            ctx->network.nodes[joining_node_id].sockfd >= 0) {
+            close(ctx->network.nodes[joining_node_id].sockfd);
+        }
+    } else {
+        ctx->network.num_nodes++;
+    }
+
+    /* Store connection with CORRECT node_id mapping */
+    ctx->network.nodes[joining_node_id].sockfd = sockfd;
+    ctx->network.nodes[joining_node_id].connected = true;
+    ctx->network.nodes[joining_node_id].id = joining_node_id;
+    ctx->network.nodes[joining_node_id].port = port;
+    if (hostname[0] != '\0') {
+        strncpy(ctx->network.nodes[joining_node_id].hostname, hostname, MAX_HOSTNAME_LEN - 1);
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    LOG_INFO("Node %u successfully joined (sockfd=%d, total_nodes=%d)",
+             joining_node_id, sockfd, ctx->network.num_nodes);
+
+    return DSM_SUCCESS;
+}
+
+/* HEARTBEAT */
+int send_heartbeat(node_id_t target) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_HEARTBEAT;
+    msg.header.sender = ctx->node_id;
+
+    return network_send(target, &msg);
+}
+
+int handle_heartbeat(const message_t *msg) {
+    /* Heartbeat received - connection is alive, nothing more to do */
+    LOG_DEBUG("Received HEARTBEAT from node %u", msg->header.sender);
+    return DSM_SUCCESS;
+}
+
 /* Dispatcher */
-int dispatch_message(const message_t *msg) {
+int dispatch_message(const message_t *msg, int sockfd) {
     switch (msg->header.type) {
         case MSG_PAGE_REQUEST:
             return handle_page_request(msg);
@@ -585,6 +710,19 @@ int dispatch_message(const message_t *msg) {
             return handle_barrier_release(msg);
         case MSG_ALLOC_NOTIFY:
             return handle_alloc_notify(msg);
+        case MSG_NODE_JOIN:
+            return handle_node_join(msg, sockfd);
+        case MSG_HEARTBEAT:
+            return handle_heartbeat(msg);
+        case MSG_NODE_LEAVE:
+            LOG_INFO("Received NODE_LEAVE from node %u", msg->header.sender);
+            return DSM_SUCCESS;
+        case MSG_ERROR:
+            LOG_ERROR("Received ERROR message from node %u: code=%d, msg=%s",
+                     msg->header.sender,
+                     msg->payload.error.error_code,
+                     msg->payload.error.error_msg);
+            return DSM_SUCCESS;
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;

@@ -185,7 +185,7 @@ int directory_set_writer(page_directory_t *dir, page_id_t page_id, node_id_t wri
     }
 
     /* If current owner is different and not the writer, add to invalidation list */
-    if (entry->owner != writer && entry->owner != 0) {
+    if (entry->owner != writer && entry->owner != (node_id_t)-1) {
         bool already_in_list = false;
         for (int i = 0; i < *num_invalidate; i++) {
             if (invalidate_list[i] == entry->owner) {

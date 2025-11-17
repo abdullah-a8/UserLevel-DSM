@@ -102,22 +102,17 @@ static void* accept_thread(void *arg) {
             continue;
         }
 
-        LOG_INFO("Accepted connection from %s:%d",
+        LOG_INFO("Accepted connection from %s:%d (sockfd=%d)",
                  inet_ntoa(client_addr.sin_addr),
-                 ntohs(client_addr.sin_port));
+                 ntohs(client_addr.sin_port),
+                 client_fd);
 
-        /* Store connection (simplified - store in first available slot) */
-        pthread_mutex_lock(&ctx->lock);
-        for (int i = 0; i < MAX_NODES; i++) {
-            if (!ctx->network.nodes[i].connected) {
-                ctx->network.nodes[i].sockfd = client_fd;
-                ctx->network.nodes[i].connected = true;
-                ctx->network.nodes[i].id = i;
-                ctx->network.num_nodes++;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&ctx->lock);
+        /* NOTE: Do NOT assign node_id here!
+         * The connecting node will send MSG_NODE_JOIN with its node_id,
+         * which will be handled by handle_node_join() to properly map
+         * the socket to the correct node_id.
+         * This solves the critical bug where connections were stored
+         * in the wrong slot (first available vs actual node_id). */
     }
 
     return NULL;
@@ -427,9 +422,10 @@ static void* dispatcher_thread(void *arg) {
         for (int i = 0; i < nfds; i++) {
             if (fds[i].revents & POLLIN) {
                 message_t msg;
-                if (network_recv(fds[i].fd, &msg) == DSM_SUCCESS) {
-                    LOG_DEBUG("Received message type=%d", msg.header.type);
-                    dispatch_message(&msg);
+                int sockfd = fds[i].fd;
+                if (network_recv(sockfd, &msg) == DSM_SUCCESS) {
+                    LOG_DEBUG("Received message type=%d from sockfd=%d", msg.header.type, sockfd);
+                    dispatch_message(&msg, sockfd);
                 }
             }
         }

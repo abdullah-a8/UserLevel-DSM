@@ -116,6 +116,17 @@ int dsm_init(const dsm_config_t *config) {
                 return rc;
             }
 
+            /* Send NODE_JOIN to identify ourselves to the manager */
+            LOG_INFO("Sending NODE_JOIN to manager (node_id=%u)", config->node_id);
+            extern int send_node_join(node_id_t node_id, const char *hostname, uint16_t port);
+            rc = send_node_join(config->node_id, "worker", config->port);
+            if (rc != DSM_SUCCESS) {
+                LOG_WARN("Failed to send NODE_JOIN (rc=%d), but continuing", rc);
+            }
+
+            /* Give manager time to process NODE_JOIN */
+            usleep(100000);  /* 100ms */
+
             LOG_INFO("Connected to manager successfully");
         }
     }

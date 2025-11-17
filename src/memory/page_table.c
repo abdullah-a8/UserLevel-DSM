@@ -63,7 +63,9 @@ page_table_t* page_table_create(void *base_addr, size_t size, node_id_t node_id,
         table->entries[i].is_allocated = true;
         table->entries[i].request_pending = false;
         table->entries[i].num_waiting_threads = 0;
+        table->entries[i].pending_inv_acks = 0;
         pthread_cond_init(&table->entries[i].ready_cv, NULL);
+        pthread_cond_init(&table->entries[i].inv_ack_cv, NULL);
         pthread_mutex_init(&table->entries[i].entry_lock, NULL);
     }
 
@@ -110,7 +112,9 @@ page_table_t* page_table_create_remote(void *base_addr, size_t size, node_id_t o
         table->entries[i].is_allocated = true;
         table->entries[i].request_pending = false;
         table->entries[i].num_waiting_threads = 0;
+        table->entries[i].pending_inv_acks = 0;
         pthread_cond_init(&table->entries[i].ready_cv, NULL);
+        pthread_cond_init(&table->entries[i].inv_ack_cv, NULL);
         pthread_mutex_init(&table->entries[i].entry_lock, NULL);
     }
 
@@ -128,6 +132,7 @@ void page_table_destroy(page_table_t *table) {
     if (table->entries) {
         for (size_t i = 0; i < table->num_pages; i++) {
             pthread_cond_destroy(&table->entries[i].ready_cv);
+            pthread_cond_destroy(&table->entries[i].inv_ack_cv);
             pthread_mutex_destroy(&table->entries[i].entry_lock);
         }
         free(table->entries);

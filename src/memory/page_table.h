@@ -34,6 +34,10 @@ typedef struct {
     int num_waiting_threads;   /**< Number of threads waiting for this page */
     pthread_cond_t ready_cv;   /**< Condition variable for waiting threads */
     pthread_mutex_t entry_lock;/**< Per-entry lock for finer-grained locking */
+
+    /* For invalidation ACK tracking */
+    int pending_inv_acks;      /**< Number of pending invalidation ACKs */
+    pthread_cond_t inv_ack_cv; /**< Condition variable for waiting on ACKs */
 } page_entry_t;
 
 /* ============================ */

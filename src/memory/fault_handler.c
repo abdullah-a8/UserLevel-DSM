@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <ucontext.h>
 
 static struct sigaction old_sa;
 
@@ -43,7 +44,6 @@ void uninstall_fault_handler(void) {
 
 static void dsm_fault_handler(int sig, siginfo_t *info, void *context) {
     (void)sig;
-    (void)context;
 
     void *fault_addr = info->si_addr;
     long tid = syscall(SYS_gettid);
@@ -82,13 +82,49 @@ static void dsm_fault_handler(int sig, siginfo_t *info, void *context) {
     ctx->stats.page_faults++;
     pthread_mutex_unlock(&ctx->stats_lock);
 
-    LOG_DEBUG("[%ld] Page fault at %p (page_id=%lu, state=%d)",
-              tid, fault_addr, entry->id, entry->state);
+    /* Detect if this was a read or write fault using architecture-specific error code */
+    bool is_write_fault = false;
 
-    /* For now, assume write fault and upgrade to READ_WRITE */
-    int rc = handle_write_fault(fault_addr);
+#if defined(__x86_64__) || defined(__i386__)
+    /* On x86/x86_64, the error code is in ucontext */
+    if (context) {
+        ucontext_t *uctx = (ucontext_t *)context;
+        /* Bit 1 (0x2) indicates write fault, bit 0 (0x1) indicates protection fault */
+        unsigned long err = uctx->uc_mcontext.gregs[REG_ERR];
+        is_write_fault = (err & 0x2) != 0;
+        LOG_DEBUG("[%ld] Page fault at %p (page_id=%lu, state=%d, err=0x%lx, %s)",
+                  tid, fault_addr, entry->id, entry->state, err,
+                  is_write_fault ? "WRITE" : "READ");
+    } else {
+        /* No context, conservatively assume write fault */
+        is_write_fault = true;
+        LOG_DEBUG("[%ld] Page fault at %p (page_id=%lu, state=%d, assuming WRITE)",
+                  tid, fault_addr, entry->id, entry->state);
+    }
+#elif defined(__aarch64__)
+    /* On ARM64, would use different mechanism - ESR_EL1 register */
+    /* For now, conservatively assume write fault */
+    is_write_fault = true;
+    LOG_DEBUG("[%ld] Page fault at %p (page_id=%lu, state=%d, ARM64 assuming WRITE)",
+              tid, fault_addr, entry->id, entry->state);
+#else
+    /* Unknown architecture, conservatively assume write fault */
+    is_write_fault = true;
+    LOG_DEBUG("[%ld] Page fault at %p (page_id=%lu, state=%d, unknown arch assuming WRITE)",
+              tid, fault_addr, entry->id, entry->state);
+#endif
+
+    /* Handle fault based on type */
+    int rc;
+    if (is_write_fault) {
+        rc = handle_write_fault(fault_addr);
+    } else {
+        rc = handle_read_fault(fault_addr);
+    }
+
     if (rc != DSM_SUCCESS) {
-        LOG_ERROR("[%ld] Failed to handle fault at %p", tid, fault_addr);
+        LOG_ERROR("[%ld] Failed to handle %s fault at %p",
+                  tid, is_write_fault ? "write" : "read", fault_addr);
         signal(SIGSEGV, SIG_DFL);
         raise(SIGSEGV);
     }

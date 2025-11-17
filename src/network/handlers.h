@@ -38,7 +38,13 @@ int handle_barrier_release(const message_t *msg);
 int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t owner, size_t num_pages, void *base_addr, size_t total_size);
 int handle_alloc_notify(const message_t *msg);
 
+/* Node management messages */
+int send_node_join(node_id_t node_id, const char *hostname, uint16_t port);
+int handle_node_join(const message_t *msg, int sockfd);
+int send_heartbeat(node_id_t target);
+int handle_heartbeat(const message_t *msg);
+
 /* Dispatch incoming message */
-int dispatch_message(const message_t *msg);
+int dispatch_message(const message_t *msg, int sockfd);
 
 #endif /* HANDLERS_H */

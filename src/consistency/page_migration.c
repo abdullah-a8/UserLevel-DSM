@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 /* Global page directory (managed by manager node or replicated) */
 static page_directory_t *g_directory = NULL;
@@ -257,6 +258,11 @@ int fetch_page_write(page_id_t page_id) {
         return rc;
     }
 
+    /* Initialize ACK counter before sending invalidations */
+    pthread_mutex_lock(&entry->entry_lock);
+    entry->pending_inv_acks = num_invalidate;
+    pthread_mutex_unlock(&entry->entry_lock);
+
     /* Send invalidations to all sharers */
     for (int i = 0; i < num_invalidate; i++) {
         LOG_DEBUG("Sending invalidation for page %lu to node %u",
@@ -264,6 +270,10 @@ int fetch_page_write(page_id_t page_id) {
         rc = send_invalidate(invalidate_list[i], page_id);
         if (rc != DSM_SUCCESS) {
             LOG_WARN("Failed to send invalidation to node %u", invalidate_list[i]);
+            /* Decrement pending count if send failed */
+            pthread_mutex_lock(&entry->entry_lock);
+            entry->pending_inv_acks--;
+            pthread_mutex_unlock(&entry->entry_lock);
         }
 
         /* Update stats */
@@ -272,11 +282,24 @@ int fetch_page_write(page_id_t page_id) {
         pthread_mutex_unlock(&ctx->stats_lock);
     }
 
-    /* Wait for ACKs (simplified - in real implementation would track ACKs) */
-    /* For now, just sleep briefly to allow ACKs to arrive */
+    /* Wait for all invalidation ACKs with timeout */
     if (num_invalidate > 0) {
-        struct timespec wait = {0, 100000000};  /* 100ms */
-        nanosleep(&wait, NULL);
+        pthread_mutex_lock(&entry->entry_lock);
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 5;  /* 5 second timeout for ACKs */
+
+        while (entry->pending_inv_acks > 0) {
+            rc = pthread_cond_timedwait(&entry->inv_ack_cv, &entry->entry_lock, &timeout);
+            if (rc == ETIMEDOUT) {
+                LOG_WARN("Timeout waiting for %d invalidation ACKs for page %lu",
+                         entry->pending_inv_acks, page_id);
+                entry->pending_inv_acks = 0;  /* Reset to avoid blocking forever */
+                break;
+            }
+        }
+        pthread_mutex_unlock(&entry->entry_lock);
+        LOG_DEBUG("Received all invalidation ACKs for page %lu", page_id);
     }
 
     /* If we were not the owner, request page data */

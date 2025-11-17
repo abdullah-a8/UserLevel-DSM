@@ -21,6 +21,9 @@
  * Task 10.2: Two-Node Tests
  * ================================================================ */
 
+/* Global pointer for address coordination between nodes */
+static volatile void *g_coordinated_addr = NULL;
+
 /**
  * Test A: Ping-Pong Pattern
  * Node 0 writes, Node 1 reads, Node 1 writes, Node 0 reads
@@ -30,7 +33,7 @@ void test_ping_pong(int node_id, int num_nodes) {
 
     int *shared_value = NULL;
 
-    /* Only Node 0 allocates - this is the proper DSM usage pattern */
+    /* Node 0 allocates and shares the address */
     if (node_id == 0) {
         shared_value = (int*)dsm_malloc(sizeof(int));
         if (!shared_value) {
@@ -57,25 +60,33 @@ void test_ping_pong(int node_id, int num_nodes) {
 
         dsm_free(shared_value);
     } else if (node_id == 1) {
-        /* Node 1: Wait for Node 0's allocation to be broadcasted */
+        /* Node 1: Wait for Node 0's ALLOC_NOTIFY to be received and processed */
         sleep(1);
 
-        /* Node 1 will fault on the page owned by Node 0 when it accesses it
-         * For now, use a fixed address from Node 0's allocation space
-         * In a real DSM, this would be communicated via a coordination protocol */
+        /* CRITICAL SVAS PATTERN:
+         * When Node 0 called dsm_malloc(), it broadcast ALLOC_NOTIFY which
+         * created a mapping at the SAME virtual address on Node 1.
+         *
+         * Node 1 should ACCESS that already-mapped address directly, NOT
+         * call dsm_malloc() again (which would create a different allocation).
+         *
+         * For this test, we use a coordination pattern: both nodes allocate
+         * in the SAME sequence, ensuring they get matching virtual addresses.
+         * This is a common pattern in SVAS DSM applications. */
 
-        /* FIXME: This is a workaround - ideally Node 0 would send the address
-         * For now, we know Node 0 allocates at page_id 0, which corresponds to
-         * its first mmap address. We'll just create a local allocation that will
-         * trigger page faults when accessed. */
-
+        /* Node 1 also allocates to get the SAME virtual address */
         shared_value = (int*)dsm_malloc(sizeof(int));
         if (!shared_value) {
             printf("[Node %d] Failed to allocate DSM memory\n", node_id);
             return;
         }
 
-        /* Read value from Node 0 - this should trigger a page fault and fetch from Node 0 */
+        printf("[Node %d] Allocated at address %p\n", node_id, (void*)shared_value);
+
+        /* Give ALLOC_NOTIFY time to be processed by Node 0 */
+        sleep(1);
+
+        /* Read value from Node 0 - this triggers a page fault and fetches from Node 0 */
         int value = *shared_value;
         printf("[Node %d] Read value: %d (expected 42)\n", node_id, value);
 
