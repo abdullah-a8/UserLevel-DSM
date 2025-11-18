@@ -90,6 +90,7 @@ int handle_page_request(const message_t *msg) {
         err_msg.header.type = MSG_ERROR;
         err_msg.header.sender = ctx->node_id;
         err_msg.payload.error.error_code = DSM_ERROR_INVALID;
+        err_msg.payload.error.page_id = page_id;
         snprintf(err_msg.payload.error.error_msg, 256,
                  "Page %lu is INVALID - requester should retry directory lookup", page_id);
         network_send(requester, &err_msg);
@@ -772,7 +773,6 @@ int wait_for_alloc_acks(page_id_t start_page_id, page_id_t end_page_id,
 
 /* NODE_JOIN */
 int send_node_join(node_id_t node_id, const char *hostname, uint16_t port) {
-    dsm_context_t *ctx = dsm_get_context();
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -910,7 +910,6 @@ static void* heartbeat_thread_func(void *arg) {
     (void)arg;
     dsm_context_t *ctx = dsm_get_context();
 
-    const uint64_t HEARTBEAT_INTERVAL_NS = 2000000000ULL;  /* 2 seconds */
     const uint64_t HEARTBEAT_TIMEOUT_NS = 6000000000ULL;   /* 6 seconds (3 missed) */
     const int MAX_MISSED_HEARTBEATS = 3;
 
@@ -968,6 +967,10 @@ static void* heartbeat_thread_func(void *arg) {
                             /* Release lock during directory operation to avoid deadlock */
                             pthread_mutex_unlock(&ctx->lock);
                             directory_handle_node_failure(dir, failed_node_id);
+                            
+                            /* Broadcast failure to others */
+                            broadcast_node_failure(failed_node_id);
+
                             pthread_mutex_lock(&ctx->lock);
                             /* Note: Need to recheck loop condition after reacquiring lock */
                         }
@@ -1026,6 +1029,137 @@ void stop_heartbeat_thread(void) {
     }
 }
 
+/* DIRECTORY PROTOCOL */
+int send_dir_query(node_id_t manager, page_id_t page_id) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_DIR_QUERY;
+    msg.header.sender = ctx->node_id;
+    msg.payload.dir_query.page_id = page_id;
+    msg.payload.dir_query.requester = ctx->node_id;
+    
+    return network_send(manager, &msg);
+}
+
+int send_dir_reply(node_id_t requester, page_id_t page_id, node_id_t owner) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_DIR_REPLY;
+    msg.header.sender = ctx->node_id;
+    msg.payload.dir_reply.page_id = page_id;
+    msg.payload.dir_reply.owner = owner;
+    
+    return network_send(requester, &msg);
+}
+
+int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_OWNER_UPDATE;
+    msg.header.sender = ctx->node_id;
+    msg.payload.owner_update.page_id = page_id;
+    msg.payload.owner_update.new_owner = new_owner;
+    
+    return network_send(manager, &msg);
+}
+
+int handle_dir_query(const message_t *msg) {
+    page_id_t page_id = msg->payload.dir_query.page_id;
+    node_id_t requester = msg->payload.dir_query.requester;
+    
+    page_directory_t *dir = get_page_directory();
+    node_id_t owner = 0; 
+    
+    if (dir) {
+        directory_lookup(dir, page_id, &owner);
+    }
+    
+    return send_dir_reply(requester, page_id, owner);
+}
+
+int handle_dir_reply(const message_t *msg) {
+    page_id_t page_id = msg->payload.dir_reply.page_id;
+    node_id_t owner = msg->payload.dir_reply.owner;
+    
+    dsm_context_t *ctx = dsm_get_context();
+    pthread_mutex_lock(&ctx->network.dir_tracker.lock);
+    
+    if (ctx->network.dir_tracker.active && 
+        ctx->network.dir_tracker.page_id == page_id) {
+        ctx->network.dir_tracker.owner = owner;
+        ctx->network.dir_tracker.complete = true;
+        pthread_cond_signal(&ctx->network.dir_tracker.cv);
+    }
+    
+    pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
+    return DSM_SUCCESS;
+}
+
+int handle_owner_update(const message_t *msg) {
+    page_id_t page_id = msg->payload.owner_update.page_id;
+    node_id_t new_owner = msg->payload.owner_update.new_owner;
+    
+    page_directory_t *dir = get_page_directory();
+    if (dir) {
+        directory_set_owner(dir, page_id, new_owner);
+        LOG_DEBUG("Updated directory (via MSG): page %lu now owned by node %u", page_id, new_owner);
+    }
+    return DSM_SUCCESS;
+}
+
+int broadcast_node_failure(node_id_t failed_node) {
+    dsm_context_t *ctx = dsm_get_context();
+    
+    /* Broadcast to all connected nodes */
+    for (int i = 0; i < MAX_NODES; i++) {
+        pthread_mutex_lock(&ctx->lock);
+        bool connected = ctx->network.nodes[i].connected;
+        node_id_t node_id = ctx->network.nodes[i].id;
+        pthread_mutex_unlock(&ctx->lock);
+
+        /* Don't send to self or the failed node */
+        if (connected && node_id != ctx->node_id && node_id != failed_node) {
+            
+            message_t msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.header.magic = MSG_MAGIC;
+            msg.header.type = MSG_NODE_FAILED;
+            msg.header.sender = ctx->node_id;
+            msg.payload.node_failed.failed_node = failed_node;
+            
+            LOG_INFO("Broadcasting NODE_FAILED for node %u to node %u", 
+                     failed_node, node_id);
+            network_send(node_id, &msg);
+        }
+    }
+    return DSM_SUCCESS;
+}
+
+int handle_node_failed_msg(const message_t *msg) {
+    node_id_t failed_node = msg->payload.node_failed.failed_node;
+    dsm_context_t *ctx = dsm_get_context();
+    
+    pthread_mutex_lock(&ctx->lock);
+    if (failed_node < MAX_NODES && !ctx->network.nodes[failed_node].is_failed) {
+         ctx->network.nodes[failed_node].is_failed = true;
+         LOG_WARN("Marked node %u as FAILED via notification", failed_node);
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    
+    page_directory_t *dir = get_page_directory();
+    if (dir) {
+        directory_handle_node_failure(dir, failed_node);
+    }
+    
+    return DSM_SUCCESS;
+}
+
 /* Dispatcher */
 int dispatch_message(const message_t *msg, int sockfd) {
     switch (msg->header.type) {
@@ -1058,15 +1192,52 @@ int dispatch_message(const message_t *msg, int sockfd) {
         case MSG_HEARTBEAT_ACK:
             /* Optional, currently unused */
             return DSM_SUCCESS;
+        case MSG_DIR_QUERY:
+            return handle_dir_query(msg);
+        case MSG_DIR_REPLY:
+            return handle_dir_reply(msg);
+        case MSG_OWNER_UPDATE:
+            return handle_owner_update(msg);
+        case MSG_NODE_FAILED:
+            return handle_node_failed_msg(msg);
         case MSG_NODE_LEAVE:
             LOG_INFO("Received NODE_LEAVE from node %u", msg->header.sender);
             return DSM_SUCCESS;
         case MSG_ERROR:
-            LOG_ERROR("Received ERROR message from node %u: code=%d, msg=%s",
-                     msg->header.sender,
-                     msg->payload.error.error_code,
-                     msg->payload.error.error_msg);
-            return DSM_SUCCESS;
+            {
+                int error_code = msg->payload.error.error_code;
+                page_id_t page_id = msg->payload.error.page_id;
+                LOG_ERROR("Received ERROR message from node %u: code=%d, page=%lu, msg=%s",
+                         msg->header.sender, error_code, page_id,
+                         msg->payload.error.error_msg);
+
+                /* If this error relates to a page request, we need to wake the waiter */
+                dsm_context_t *ctx = dsm_get_context();
+                
+                /* Find relevant table */
+                page_entry_t *entry = NULL;
+                pthread_mutex_lock(&ctx->lock);
+                for (int i = 0; i < ctx->num_allocations; i++) {
+                    if (ctx->page_tables[i]) {
+                        entry = page_table_lookup_by_id(ctx->page_tables[i], page_id);
+                        if (entry) break;
+                    }
+                }
+                pthread_mutex_unlock(&ctx->lock);
+                
+                if (entry) {
+                    pthread_mutex_lock(&entry->entry_lock);
+                    if (entry->request_pending) {
+                        /* Propagate error code so fetch_page can retry */
+                        entry->fetch_result = error_code;
+                        entry->request_pending = false;
+                        pthread_cond_broadcast(&entry->ready_cv);
+                        LOG_DEBUG("Woke waiter for page %lu due to error", page_id);
+                    }
+                    pthread_mutex_unlock(&entry->entry_lock);
+                }
+                return DSM_SUCCESS;
+            }
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;

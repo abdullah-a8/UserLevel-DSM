@@ -36,6 +36,10 @@ typedef enum {
     MSG_NODE_LEAVE,            /**< Node leaving cluster */
     MSG_HEARTBEAT,             /**< Keep-alive heartbeat */
     MSG_HEARTBEAT_ACK,         /**< Acknowledge heartbeat (optional) */
+    MSG_DIR_QUERY,             /**< Query directory for page owner */
+    MSG_DIR_REPLY,             /**< Reply with page owner */
+    MSG_OWNER_UPDATE,          /**< Update directory with new owner */
+    MSG_NODE_FAILED,           /**< Notify of node failure */
     MSG_ERROR                  /**< Error response */
 } msg_type_t;
 
@@ -187,10 +191,42 @@ typedef struct {
 } __attribute__((packed)) heartbeat_ack_payload_t;
 
 /**
+ * DIR_QUERY message payload
+ */
+typedef struct {
+    page_id_t page_id;         /**< Requested page ID */
+    node_id_t requester;       /**< Requesting node ID */
+} __attribute__((packed)) dir_query_payload_t;
+
+/**
+ * DIR_REPLY message payload
+ */
+typedef struct {
+    page_id_t page_id;         /**< Page ID */
+    node_id_t owner;           /**< Current owner node ID */
+} __attribute__((packed)) dir_reply_payload_t;
+
+/**
+ * OWNER_UPDATE message payload
+ */
+typedef struct {
+    page_id_t page_id;         /**< Page ID */
+    node_id_t new_owner;       /**< New owner node ID */
+} __attribute__((packed)) owner_update_payload_t;
+
+/**
+ * NODE_FAILED message payload
+ */
+typedef struct {
+    node_id_t failed_node;     /**< Failed node ID */
+} __attribute__((packed)) node_failed_payload_t;
+
+/**
  * ERROR message payload
  */
 typedef struct {
     int error_code;            /**< Error code */
+    page_id_t page_id;         /**< Page ID related to error (if any) */
     char error_msg[256];       /**< Error description */
 } __attribute__((packed)) error_payload_t;
 
@@ -220,6 +256,10 @@ typedef struct {
         node_join_payload_t node_join;
         node_leave_payload_t node_leave;
         heartbeat_ack_payload_t heartbeat_ack;
+        dir_query_payload_t dir_query;
+        dir_reply_payload_t dir_reply;
+        owner_update_payload_t owner_update;
+        node_failed_payload_t node_failed;
         error_payload_t error;
         uint8_t raw[PAGE_SIZE + 256]; /**< Raw buffer for largest payload */
     } payload;

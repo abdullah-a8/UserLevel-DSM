@@ -170,4 +170,15 @@ int directory_handle_node_failure(page_directory_t *dir, node_id_t failed_node);
  */
 int directory_reclaim_ownership(page_directory_t *dir, page_id_t page_id, node_id_t new_owner);
 
+/**
+ * Query the directory manager (Node 0) for the current owner of a page.
+ * If this node is Node 0, it performs a local lookup.
+ * Otherwise, it sends a request to Node 0 and waits for the reply.
+ *
+ * @param page_id Page identifier
+ * @param owner Output: current owner node ID
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int query_directory_manager(page_id_t page_id, node_id_t *owner);
+
 #endif /* DIRECTORY_H */

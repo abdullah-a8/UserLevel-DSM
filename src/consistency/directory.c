@@ -4,9 +4,14 @@
  */
 
 #include "directory.h"
+#include "page_migration.h"
 #include "../core/log.h"
+#include "../core/dsm_context.h"
+#include "../network/handlers.h"
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 /* Hash function for page IDs */
 static inline size_t hash_page_id(page_id_t page_id, size_t table_size) {
@@ -311,7 +316,6 @@ int directory_remove_entry(page_directory_t *dir, page_id_t page_id) {
     pthread_mutex_lock(&dir->lock);
 
     directory_entry_t **curr = &dir->buckets[bucket];
-    directory_entry_t *prev = NULL;
 
     /* Search for entry in chain */
     while (*curr != NULL) {
@@ -331,7 +335,6 @@ int directory_remove_entry(page_directory_t *dir, page_id_t page_id) {
                       page_id, dir->num_entries);
             return DSM_SUCCESS;
         }
-        prev = *curr;
         curr = &(*curr)->next;
     }
 
@@ -421,5 +424,53 @@ int directory_reclaim_ownership(page_directory_t *dir, page_id_t page_id, node_i
     LOG_INFO("Reclaimed ownership of page %lu: old_owner=%u (failed), new_owner=%u",
              page_id, old_owner, new_owner);
 
+    return DSM_SUCCESS;
+}
+
+int query_directory_manager(page_id_t page_id, node_id_t *owner) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* If we are the manager (Node 0), query local directory */
+    if (ctx->node_id == 0) {
+        page_directory_t *dir = get_page_directory();
+        return directory_lookup(dir, page_id, owner);
+    }
+
+    /* If not manager, query manager via network */
+    pthread_mutex_lock(&ctx->network.dir_tracker.lock);
+
+    /* Setup tracker */
+    ctx->network.dir_tracker.page_id = page_id;
+    ctx->network.dir_tracker.active = true;
+    ctx->network.dir_tracker.complete = false;
+
+    /* Send query */
+    int rc = send_dir_query(0, page_id);
+    if (rc != DSM_SUCCESS) {
+        ctx->network.dir_tracker.active = false;
+        pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
+        return rc;
+    }
+
+    /* Wait for reply */
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 1; /* 1 second timeout */
+
+    while (!ctx->network.dir_tracker.complete) {
+        rc = pthread_cond_timedwait(&ctx->network.dir_tracker.cv,
+                                   &ctx->network.dir_tracker.lock, &timeout);
+        if (rc == ETIMEDOUT) {
+            LOG_ERROR("Timeout querying directory manager for page %lu", page_id);
+            ctx->network.dir_tracker.active = false;
+            pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
+            return DSM_ERROR_TIMEOUT;
+        }
+    }
+
+    *owner = ctx->network.dir_tracker.owner;
+    ctx->network.dir_tracker.active = false;
+
+    pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
     return DSM_SUCCESS;
 }

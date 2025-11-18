@@ -48,6 +48,16 @@ int send_node_join(node_id_t node_id, const char *hostname, uint16_t port);
 int handle_node_join(const message_t *msg, int sockfd);
 int send_heartbeat(node_id_t target);
 int handle_heartbeat(const message_t *msg);
+int broadcast_node_failure(node_id_t failed_node);
+
+/* Directory protocol messages */
+int send_dir_query(node_id_t manager, page_id_t page_id);
+int send_dir_reply(node_id_t requester, page_id_t page_id, node_id_t owner);
+int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner);
+int handle_dir_query(const message_t *msg);
+int handle_dir_reply(const message_t *msg);
+int handle_owner_update(const message_t *msg);
+int handle_node_failed_msg(const message_t *msg);
 
 /* Failure detection */
 void start_heartbeat_thread(void);

@@ -180,8 +180,8 @@ page_entry_t* page_table_lookup_by_addr(page_table_t *table, void *addr) {
     }
 
     /* Check if address is within range */
-    if (addr < table->base_addr ||
-        addr >= (char*)table->base_addr + table->total_size) {
+    if ((char*)addr < (char*)table->base_addr ||
+        (char*)addr >= (char*)table->base_addr + table->total_size) {
         return NULL;
     }
 

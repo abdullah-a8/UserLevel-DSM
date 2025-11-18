@@ -97,6 +97,10 @@ void test_directory_set_writer(void) {
     assert(rc == DSM_SUCCESS);
     assert(owner == 4);
 
+    /* Simulate invalidation ACKs received and clearing sharers */
+    rc = directory_clear_sharers(dir, 0);
+    assert(rc == DSM_SUCCESS);
+
     /* Verify sharers list cleared */
     node_id_t sharers[MAX_SHARERS];
     int count;

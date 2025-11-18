@@ -72,6 +72,18 @@ void* dsm_malloc(size_t size);
 int dsm_free(void *ptr);
 
 /**
+ * Get the base address of a DSM allocation by index
+ *
+ * Useful for coordinating shared objects in multi-node tests.
+ * Use dsm_malloc() on Node 0, and dsm_get_allocation(0) on other nodes
+ * after a barrier to ensure they map the same object.
+ *
+ * @param index Index of the allocation (0-based)
+ * @return Pointer to allocated memory, or NULL if not found
+ */
+void* dsm_get_allocation(int index);
+
+/**
  * Get current node ID
  *
  * @return This node's unique identifier

@@ -45,6 +45,18 @@ typedef struct {
 } alloc_ack_tracker_t;
 
 /**
+ * Directory Query Tracker
+ */
+typedef struct {
+    page_id_t page_id;           /**< Page being queried */
+    node_id_t owner;             /**< Owner returned */
+    bool active;                 /**< Is query active? */
+    bool complete;               /**< Is query complete? */
+    pthread_mutex_t lock;        /**< Lock */
+    pthread_cond_t cv;           /**< Wait variable */
+} dir_query_tracker_t;
+
+/**
  * Network state
  */
 typedef struct {
@@ -68,6 +80,9 @@ typedef struct {
 
     /* Allocation ACK tracking */
     alloc_ack_tracker_t alloc_tracker;
+
+    /* Directory Query tracking */
+    dir_query_tracker_t dir_tracker;
 } network_state_t;
 
 /**

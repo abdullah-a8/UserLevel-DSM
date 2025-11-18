@@ -147,13 +147,27 @@ void* dsm_malloc(size_t size) {
             return addr;
         }
 
-        /* Wait for all nodes to ACK the allocation (with 10 second timeout)
+        /* Wait for all nodes to ACK the allocation (with 2 second timeout - LAN optimized)
          * This uses the shared alloc_tracker, which is now protected by allocation_lock */
         if (expected_acks > 0) {
-            rc = wait_for_alloc_acks(start_page_id, end_page_id, expected_acks, 10);
+            rc = wait_for_alloc_acks(start_page_id, end_page_id, expected_acks, 2);
             if (rc != DSM_SUCCESS) {
-                LOG_ERROR("Failed to receive all ALLOC_ACKs, but allocation proceeds");
-                /* Don't fail the allocation - system will recover via lazy propagation */
+                /* Log which nodes didn't ACK */
+                pthread_mutex_lock(&ctx->network.alloc_tracker.lock);
+                for (int i = 0; i < MAX_NODES; i++) {
+                    if (!ctx->network.alloc_tracker.acks_received[i] &&
+                        ctx->network.nodes[i].connected &&
+                        ctx->network.nodes[i].id != ctx->node_id) {
+                        LOG_ERROR("Node %u did not ACK allocation", ctx->network.nodes[i].id);
+                    }
+                }
+                pthread_mutex_unlock(&ctx->network.alloc_tracker.lock);
+
+                LOG_ERROR("Failed to receive all ALLOC_ACKs (timed out after 2s). Aborting allocation.");
+                
+                pthread_mutex_unlock(&ctx->allocation_lock);
+                dsm_free(addr);
+                return NULL;
             }
         }
 
@@ -239,6 +253,7 @@ int dsm_free(void *ptr) {
 
     /* Release the owner's reference - table will be destroyed when refcount reaches 0
      * If handlers are currently using the table, it will be destroyed when they release */
+    usleep(10000); // Grace period to allow concurrent faults to finish using the table
     page_table_release(target_table);
 
     /* Unmap memory */
@@ -250,4 +265,19 @@ int dsm_free(void *ptr) {
     LOG_INFO("dsm_free: freed %zu bytes at %p (%zu directory entries cleaned)",
              size, ptr, num_pages);
     return DSM_SUCCESS;
+}
+
+void* dsm_get_allocation(int index) {
+    dsm_context_t *ctx = dsm_get_context();
+    void *addr = NULL;
+
+    pthread_mutex_lock(&ctx->lock);
+    if (index >= 0 && index < ctx->num_allocations) {
+        if (ctx->page_tables[index]) {
+            addr = ctx->page_tables[index]->base_addr;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    
+    return addr;
 }

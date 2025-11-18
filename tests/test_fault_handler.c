@@ -27,7 +27,7 @@ static int tests_failed = 0;
 
 int test_write_fault(void) {
     dsm_config_t config = {
-        .node_id = 1,
+        .node_id = 0,
         .port = 5000,
         .num_nodes = 1,
         .is_manager = true,
@@ -69,7 +69,7 @@ int test_write_fault(void) {
 
 int test_multiple_pages(void) {
     dsm_config_t config = {
-        .node_id = 1,
+        .node_id = 0,
         .port = 5000,
         .num_nodes = 1,
         .is_manager = true,
@@ -133,7 +133,7 @@ void* thread_func(void *arg) {
 
 int test_multithreaded_faults(void) {
     dsm_config_t config = {
-        .node_id = 1,
+        .node_id = 0,
         .port = 5000,
         .num_nodes = 1,
         .is_manager = true,
@@ -173,7 +173,7 @@ int test_multithreaded_faults(void) {
 
 int test_sequential_access(void) {
     dsm_config_t config = {
-        .node_id = 1,
+        .node_id = 0,
         .port = 5000,
         .num_nodes = 1,
         .is_manager = true,

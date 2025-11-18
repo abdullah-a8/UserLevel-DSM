@@ -156,9 +156,9 @@ int main() {
 - Updates permissions via `mprotect`
 
 ### Consistency Model
-- **Single-Writer**: Only one node can write at a time
-- **Multiple-Reader**: Multiple nodes can read simultaneously
-- **Invalidation-Based**: Write access invalidates all copies
+- **Release Consistency**: Memory ordering is only enforced at synchronization points (barriers/locks).
+- **Protocol**: Single-Writer/Multiple-Reader invalidation-based protocol.
+- **See [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full details and usage examples.**
 
 ### Network Protocol
 - TCP for reliability

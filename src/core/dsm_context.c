@@ -63,6 +63,12 @@ int dsm_context_init(const dsm_config_t *config) {
         ctx->network.alloc_tracker.acks_received[i] = false;
     }
 
+    /* Initialize directory query tracker */
+    ctx->network.dir_tracker.active = false;
+    ctx->network.dir_tracker.complete = false;
+    pthread_mutex_init(&ctx->network.dir_tracker.lock, NULL);
+    pthread_cond_init(&ctx->network.dir_tracker.cv, NULL);
+
     for (int i = 0; i < MAX_NODES; i++) {
         ctx->network.nodes[i].connected = false;
         ctx->network.nodes[i].sockfd = -1;
@@ -139,6 +145,10 @@ void dsm_context_cleanup(void) {
     /* Cleanup allocation tracker */
     pthread_mutex_destroy(&ctx->network.alloc_tracker.lock);
     pthread_cond_destroy(&ctx->network.alloc_tracker.all_acks_cv);
+
+    /* Cleanup directory query tracker */
+    pthread_mutex_destroy(&ctx->network.dir_tracker.lock);
+    pthread_cond_destroy(&ctx->network.dir_tracker.cv);
 
     if (ctx->network.server_sockfd >= 0) {
         close(ctx->network.server_sockfd);

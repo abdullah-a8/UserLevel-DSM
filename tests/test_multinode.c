@@ -21,61 +21,62 @@
  * Task 10.2: Two-Node Tests
  * ================================================================ */
 
-/* Global pointer for address coordination between nodes */
-static volatile void *g_coordinated_addr = NULL;
-
 /**
  * Test A: Ping-Pong Pattern
  * Node 0 writes, Node 1 reads, Node 1 writes, Node 0 reads
- *
- * CRITICAL FIX #1: SVAS Synchronization with ALLOC_ACK
- * - dsm_malloc() now BLOCKS until all nodes have created SVAS mappings
- * - No manual sleep needed - allocation synchronization is automatic
- * - All nodes get the same virtual address for the allocation
  */
 void test_ping_pong(int node_id, int num_nodes) {
     printf("[Node %d] Starting ping-pong test...\n", node_id);
 
-    /* SVAS Allocation with automatic synchronization (FIX #1)
-     * When this returns, ALL nodes have created mappings at the same address */
-    int *shared_value = (int*)dsm_malloc(sizeof(int));
-    if (!shared_value) {
-        printf("[Node %d] Failed to allocate DSM memory\n", node_id);
-        return;
+    int *shared_value = NULL;
+
+    /* Fix: Only Node 0 allocates, others retrieve allocation */
+    if (node_id == 0) {
+        shared_value = (int*)dsm_malloc(sizeof(int));
+        if (shared_value) {
+             printf("[Node %d] Allocated at address %p\n", node_id, (void*)shared_value);
+        }
+    }
+    
+    /* Barrier 10: Wait for allocation */
+    dsm_barrier(10, num_nodes);
+    
+    if (node_id != 0) {
+        shared_value = (int*)dsm_get_allocation(0);
+        if (shared_value) {
+            printf("[Node %d] Retrieved allocation at address %p\n", node_id, (void*)shared_value);
+        }
     }
 
-    printf("[Node %d] Allocated at address %p (SVAS synchronized)\n",
-           node_id, (void*)shared_value);
+    if (!shared_value) {
+        printf("[Node %d] Failed to allocate/retrieve DSM memory\n", node_id);
+        return;
+    }
 
     if (node_id == 0) {
         /* Node 0: Initialize the value */
         *shared_value = 42;
         printf("[Node %d] Wrote initial value: %d\n", node_id, *shared_value);
 
-        /* FIXED: Use barrier instead of sleep for synchronization */
         dsm_barrier(1000, num_nodes);  /* Sync after write */
-
         dsm_barrier(1001, num_nodes);  /* Sync before read */
 
         /* Read value written by Node 1 */
         int value = *shared_value;
         printf("[Node %d] Read value: %d (expected 43)\n", node_id, value);
 
-        /* Verify correctness */
         if (value == 43) {
             printf("[Node %d] ✓ Ping-pong test PASSED\n", node_id);
         } else {
             printf("[Node %d] ✗ Ping-pong test FAILED (got %d, expected 43)\n", node_id, value);
         }
     } else if (node_id == 1) {
-        /* FIXED: Use barrier instead of sleep - wait for Node 0 to initialize */
         dsm_barrier(1000, num_nodes);  /* Sync after Node 0 writes */
 
-        /* Read value from Node 0 - triggers page fault and fetch */
+        /* Read value from Node 0 */
         int value = *shared_value;
         printf("[Node %d] Read value: %d (expected 42)\n", node_id, value);
 
-        /* Verify correctness */
         if (value != 42) {
             printf("[Node %d] ✗ Ping-pong test FAILED (got %d, expected 42)\n", node_id, value);
             dsm_free(shared_value);
@@ -86,9 +87,13 @@ void test_ping_pong(int node_id, int num_nodes) {
         *shared_value = 43;
         printf("[Node %d] Wrote value: %d\n", node_id, *shared_value);
 
-        dsm_barrier(1001, num_nodes);  /* Sync after write, before Node 0 reads */
+        dsm_barrier(1001, num_nodes);  /* Sync after write */
 
         printf("[Node %d] ✓ Ping-pong test PASSED\n", node_id);
+    } else {
+        /* Other nodes just wait */
+        dsm_barrier(1000, num_nodes);
+        dsm_barrier(1001, num_nodes);
     }
 
     dsm_free(shared_value);
@@ -101,8 +106,21 @@ void test_producer_consumer(int node_id, int num_nodes) {
     printf("[Node %d] Starting producer-consumer test...\n", node_id);
 
     const int BUFFER_SIZE = 10;
-    int *buffer = (int*)dsm_malloc(BUFFER_SIZE * sizeof(int));
-    int *count = (int*)dsm_malloc(sizeof(int));
+    int *buffer = NULL;
+    int *count = NULL;
+
+    if (node_id == 0) {
+        buffer = (int*)dsm_malloc(BUFFER_SIZE * sizeof(int));
+        count = (int*)dsm_malloc(sizeof(int));
+    }
+    
+    /* Barrier 20: Wait for allocation */
+    dsm_barrier(20, num_nodes);
+    
+    if (node_id != 0) {
+        buffer = (int*)dsm_get_allocation(0);
+        count = (int*)dsm_get_allocation(1);
+    }
 
     if (!buffer || !count) {
         printf("[Node %d] Failed to allocate DSM memory\n", node_id);
@@ -158,7 +176,19 @@ void test_producer_consumer(int node_id, int num_nodes) {
 void test_read_sharing(int node_id, int num_nodes) {
     printf("[Node %d] Starting read-sharing test...\n", node_id);
 
-    int *shared_data = (int*)dsm_malloc(PAGE_SIZE);
+    int *shared_data = NULL;
+    
+    if (node_id == 0) {
+        shared_data = (int*)dsm_malloc(PAGE_SIZE);
+    }
+    
+    /* Barrier 30: Wait for allocation */
+    dsm_barrier(30, num_nodes);
+    
+    if (node_id != 0) {
+        shared_data = (int*)dsm_get_allocation(0);
+    }
+
     if (!shared_data) {
         printf("[Node %d] Failed to allocate DSM memory\n", node_id);
         return;
@@ -173,7 +203,6 @@ void test_read_sharing(int node_id, int num_nodes) {
         }
         printf("[Node %d] Initialized shared data\n", node_id);
 
-        /* FIXED: Use barrier instead of sleep */
         dsm_barrier(2000, num_nodes);  /* Sync after initialization */
 
         /* Read data (should remain in READ_ONLY) */
@@ -183,14 +212,12 @@ void test_read_sharing(int node_id, int num_nodes) {
         }
         printf("[Node %d] Read sum: %d (expected %d)\n", node_id, sum, EXPECTED_SUM);
 
-        /* Verify correctness */
         if (sum == EXPECTED_SUM) {
             printf("[Node %d] ✓ Read-sharing test PASSED\n", node_id);
         } else {
             printf("[Node %d] ✗ Read-sharing test FAILED\n", node_id);
         }
     } else if (node_id == 1) {
-        /* FIXED: Use barrier instead of sleep - wait for Node 0 to initialize */
         dsm_barrier(2000, num_nodes);  /* Sync after Node 0 initializes */
 
         /* Read same data - should share READ_ONLY copy */
@@ -200,12 +227,13 @@ void test_read_sharing(int node_id, int num_nodes) {
         }
         printf("[Node %d] Read sum: %d (expected %d)\n", node_id, sum, EXPECTED_SUM);
 
-        /* Verify correctness */
         if (sum == EXPECTED_SUM) {
             printf("[Node %d] ✓ Read-sharing test PASSED\n", node_id);
         } else {
             printf("[Node %d] ✗ Read-sharing test FAILED\n", node_id);
         }
+    } else {
+        dsm_barrier(2000, num_nodes);
     }
 
     dsm_free(shared_data);
@@ -222,8 +250,21 @@ void test_parallel_sum(int node_id, int num_nodes) {
     printf("[Node %d] Starting parallel sum test...\n", node_id);
 
     const int ARRAY_SIZE = 1000;
-    int *array = (int*)dsm_malloc(ARRAY_SIZE * sizeof(int));
-    int *partial_sums = (int*)dsm_malloc(num_nodes * sizeof(int));
+    int *array = NULL;
+    int *partial_sums = NULL;
+
+    if (node_id == 0) {
+        array = (int*)dsm_malloc(ARRAY_SIZE * sizeof(int));
+        partial_sums = (int*)dsm_malloc(num_nodes * sizeof(int));
+    }
+    
+    /* Barrier 40: Wait for allocation */
+    dsm_barrier(40, num_nodes);
+    
+    if (node_id != 0) {
+        array = (int*)dsm_get_allocation(0);
+        partial_sums = (int*)dsm_get_allocation(1);
+    }
 
     if (!array || !partial_sums) {
         printf("[Node %d] Failed to allocate DSM memory\n", node_id);
@@ -255,7 +296,7 @@ void test_parallel_sum(int node_id, int num_nodes) {
     printf("[Node %d] Partial sum: %d (range %d-%d)\n", node_id, local_sum, start, end - 1);
 
     /* Synchronize */
-    dsm_barrier(4000, num_nodes);
+    dsm_barrier(4001, num_nodes); /* Changed ID to avoid collision */
 
     if (node_id == 0) {
         /* Compute total sum */
@@ -284,7 +325,19 @@ void test_parallel_sum(int node_id, int num_nodes) {
 void test_shared_counter(int node_id, int num_nodes) {
     printf("[Node %d] Starting shared counter test...\n", node_id);
 
-    int *counter = (int*)dsm_malloc(sizeof(int));
+    int *counter = NULL;
+    
+    if (node_id == 0) {
+        counter = (int*)dsm_malloc(sizeof(int));
+    }
+    
+    /* Barrier 50: Wait for allocation */
+    dsm_barrier(50, num_nodes);
+    
+    if (node_id != 0) {
+        counter = (int*)dsm_get_allocation(0);
+    }
+
     if (!counter) {
         printf("[Node %d] Failed to allocate DSM memory\n", node_id);
         return;
@@ -310,7 +363,7 @@ void test_shared_counter(int node_id, int num_nodes) {
         dsm_lock_release(lock);
     }
 
-    dsm_barrier(5001, num_nodes);
+    dsm_barrier(5002, num_nodes); /* Changed ID to avoid collision */
 
     if (node_id == 0) {
         int expected = num_nodes * 100;
