@@ -102,8 +102,10 @@ int dsm_barrier(barrier_id_t barrier_id, int num_participants) {
             LOG_INFO("Manager: All %d participants arrived at barrier %lu, releasing",
                      barrier->arrived_count, barrier_id);
 
-            /* Broadcast release to all nodes */
-            for (int i = 0; i < ctx->network.num_nodes; i++) {
+            /* CRITICAL FIX: Broadcast release to all nodes
+             * Must iterate through ALL slots (MAX_NODES), not just num_nodes count,
+             * because nodes are indexed by their node_id, not sequentially */
+            for (int i = 0; i < MAX_NODES; i++) {
                 if (ctx->network.nodes[i].connected && ctx->network.nodes[i].id != ctx->node_id) {
                     send_barrier_release(ctx->network.nodes[i].id, barrier_id);
                 }
