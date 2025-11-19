@@ -83,6 +83,17 @@ typedef struct {
 
     /* Directory Query tracking */
     dir_query_tracker_t dir_tracker;
+
+    /* Sharer query tracker (for complete invalidation - BUG #8 fix) */
+    struct {
+        pthread_mutex_t lock;
+        pthread_cond_t cv;
+        page_id_t page_id;
+        node_id_t sharers[32];  /* Use fixed size to avoid circular dependency */
+        int num_sharers;
+        bool active;
+        bool complete;
+    } sharer_tracker;
 } network_state_t;
 
 /**

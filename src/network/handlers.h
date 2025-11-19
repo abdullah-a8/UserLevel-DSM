@@ -57,6 +57,11 @@ int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner)
 int handle_dir_query(const message_t *msg);
 int handle_dir_reply(const message_t *msg);
 int handle_owner_update(const message_t *msg);
+
+/* Sharer tracking protocol (BUG #8 fix) */
+int send_sharer_query(node_id_t owner, page_id_t page_id);
+int handle_sharer_query(const message_t *msg);
+int handle_sharer_reply(const message_t *msg);
 int handle_node_failed_msg(const message_t *msg);
 
 /* Failure detection */

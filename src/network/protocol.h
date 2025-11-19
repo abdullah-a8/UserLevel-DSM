@@ -13,6 +13,11 @@
 #include <stdint.h>
 #include <pthread.h>
 
+/* Maximum number of sharers to track per page */
+#ifndef MAX_SHARERS
+#define MAX_SHARERS 32
+#endif
+
 /* ============================ */
 /*     Message Types            */
 /* ============================ */
@@ -40,6 +45,8 @@ typedef enum {
     MSG_DIR_REPLY,             /**< Reply with page owner */
     MSG_OWNER_UPDATE,          /**< Update directory with new owner */
     MSG_NODE_FAILED,           /**< Notify of node failure */
+    MSG_SHARER_QUERY,          /**< Query owner for page sharers */
+    MSG_SHARER_REPLY,          /**< Reply with page sharers list */
     MSG_ERROR                  /**< Error response */
 } msg_type_t;
 
@@ -222,6 +229,23 @@ typedef struct {
 } __attribute__((packed)) node_failed_payload_t;
 
 /**
+ * SHARER_QUERY message payload
+ */
+typedef struct {
+    page_id_t page_id;         /**< Page ID */
+    node_id_t requester;       /**< Requesting node ID */
+} __attribute__((packed)) sharer_query_payload_t;
+
+/**
+ * SHARER_REPLY message payload
+ */
+typedef struct {
+    page_id_t page_id;         /**< Page ID */
+    int num_sharers;           /**< Number of sharers */
+    node_id_t sharers[MAX_SHARERS]; /**< List of sharer node IDs */
+} __attribute__((packed)) sharer_reply_payload_t;
+
+/**
  * ERROR message payload
  */
 typedef struct {
@@ -260,6 +284,8 @@ typedef struct {
         dir_reply_payload_t dir_reply;
         owner_update_payload_t owner_update;
         node_failed_payload_t node_failed;
+        sharer_query_payload_t sharer_query;
+        sharer_reply_payload_t sharer_reply;
         error_payload_t error;
         uint8_t raw[PAGE_SIZE + 256]; /**< Raw buffer for largest payload */
     } payload;

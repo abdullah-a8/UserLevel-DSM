@@ -384,21 +384,73 @@ int fetch_page_write(page_id_t page_id) {
         entry->request_pending = true;
         pthread_mutex_unlock(&entry->entry_lock);
 
-        /* PERFORMANCE NOTE: Get list of nodes to invalidate and set ourselves as owner */
+        /* CRITICAL FIX (BUG #8): Query current owner for complete sharer list
+         * The owner has been tracking all nodes that requested READ access */
         node_id_t invalidate_list[MAX_SHARERS];
         int num_invalidate = 0;
+
+        if (owner != ctx->node_id) {
+            /* Query owner for sharers before invalidating */
+            pthread_mutex_lock(&ctx->network.sharer_tracker.lock);
+            ctx->network.sharer_tracker.page_id = page_id;
+            ctx->network.sharer_tracker.active = true;
+            ctx->network.sharer_tracker.complete = false;
+            ctx->network.sharer_tracker.num_sharers = 0;
+
+            rc = send_sharer_query(owner, page_id);
+            if (rc == DSM_SUCCESS) {
+                /* Wait for reply with timeout */
+                struct timespec timeout;
+                clock_gettime(CLOCK_REALTIME, &timeout);
+                timeout.tv_sec += 2;
+
+                while (!ctx->network.sharer_tracker.complete) {
+                    rc = pthread_cond_timedwait(&ctx->network.sharer_tracker.cv,
+                                               &ctx->network.sharer_tracker.lock, &timeout);
+                    if (rc == ETIMEDOUT) {
+                        LOG_WARN("Timeout querying sharers for page %lu from node %u",
+                                page_id, owner);
+                        break;
+                    }
+                }
+
+                /* Copy sharers to invalidation list */
+                if (ctx->network.sharer_tracker.complete) {
+                    for (int i = 0; i < ctx->network.sharer_tracker.num_sharers && i < MAX_SHARERS; i++) {
+                        invalidate_list[num_invalidate++] = ctx->network.sharer_tracker.sharers[i];
+                    }
+                    LOG_DEBUG("Got %d sharers for page %lu from owner", num_invalidate, page_id);
+                }
+            }
+
+            ctx->network.sharer_tracker.active = false;
+            pthread_mutex_unlock(&ctx->network.sharer_tracker.lock);
+        }
+
+        /* Also add current owner to invalidation list if different from us */
+        if (owner != ctx->node_id) {
+            bool already_in_list = false;
+            for (int i = 0; i < num_invalidate; i++) {
+                if (invalidate_list[i] == owner) {
+                    already_in_list = true;
+                    break;
+                }
+            }
+            if (!already_in_list && num_invalidate < MAX_SHARERS) {
+                invalidate_list[num_invalidate++] = owner;
+            }
+        }
+
+        /* Update our local directory */
         rc = directory_set_writer(g_directory, page_id, ctx->node_id,
                                   invalidate_list, &num_invalidate);
         if (rc != DSM_SUCCESS) {
-            LOG_ERROR("Failed to update directory for page %lu", page_id);
+            LOG_ERROR("Failed to update local directory for page %lu", page_id);
             pthread_mutex_lock(&entry->entry_lock);
-            entry->fetch_result = rc;  /* BUG FIX: Set result before waking waiters */
+            entry->fetch_result = rc;
             entry->request_pending = false;
             pthread_cond_broadcast(&entry->ready_cv);
             pthread_mutex_unlock(&entry->entry_lock);
-            
-            /* Directory failure usually isn't transient if local, but if we retry query_manager... */
-            /* This specific error is local directory failure */
             final_result = rc;
             goto cleanup;
         }

@@ -69,6 +69,13 @@ int dsm_context_init(const dsm_config_t *config) {
     pthread_mutex_init(&ctx->network.dir_tracker.lock, NULL);
     pthread_cond_init(&ctx->network.dir_tracker.cv, NULL);
 
+    /* Initialize sharer query tracker (BUG #8 fix) */
+    ctx->network.sharer_tracker.active = false;
+    ctx->network.sharer_tracker.complete = false;
+    ctx->network.sharer_tracker.num_sharers = 0;
+    pthread_mutex_init(&ctx->network.sharer_tracker.lock, NULL);
+    pthread_cond_init(&ctx->network.sharer_tracker.cv, NULL);
+
     for (int i = 0; i < MAX_NODES; i++) {
         ctx->network.nodes[i].connected = false;
         ctx->network.nodes[i].sockfd = -1;

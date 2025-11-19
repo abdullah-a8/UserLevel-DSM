@@ -151,6 +151,19 @@ int handle_page_request(const message_t *msg) {
         } else {
             pthread_mutex_unlock(&owning_table->lock);
         }
+
+        /* CRITICAL FIX (BUG #8): Track requester as sharer in owner's directory
+         * This ensures future writers can get complete sharer list for invalidations */
+        page_directory_t *dir = get_page_directory();
+        if (dir) {
+            rc = directory_add_reader(dir, page_id, requester);
+            if (rc != DSM_SUCCESS && rc != DSM_ERROR_BUSY) {
+                LOG_WARN("Failed to add node %u as sharer for page %lu", requester, page_id);
+            } else {
+                LOG_DEBUG("Tracked node %u as sharer for page %lu in owner's directory",
+                         requester, page_id);
+            }
+        }
     }
 
     page_table_release(owning_table);
@@ -1144,19 +1157,92 @@ int broadcast_node_failure(node_id_t failed_node) {
 int handle_node_failed_msg(const message_t *msg) {
     node_id_t failed_node = msg->payload.node_failed.failed_node;
     dsm_context_t *ctx = dsm_get_context();
-    
+
     pthread_mutex_lock(&ctx->lock);
     if (failed_node < MAX_NODES && !ctx->network.nodes[failed_node].is_failed) {
          ctx->network.nodes[failed_node].is_failed = true;
          LOG_WARN("Marked node %u as FAILED via notification", failed_node);
     }
     pthread_mutex_unlock(&ctx->lock);
-    
+
     page_directory_t *dir = get_page_directory();
     if (dir) {
         directory_handle_node_failure(dir, failed_node);
     }
-    
+
+    return DSM_SUCCESS;
+}
+
+/* CRITICAL FIX (BUG #8): Sharer tracking protocol */
+int send_sharer_query(node_id_t owner, page_id_t page_id) {
+    dsm_context_t *ctx = dsm_get_context();
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_SHARER_QUERY;
+    msg.header.sender = ctx->node_id;
+    msg.payload.sharer_query.page_id = page_id;
+    msg.payload.sharer_query.requester = ctx->node_id;
+
+    LOG_DEBUG("Querying node %u for sharers of page %lu", owner, page_id);
+    return network_send(owner, &msg);
+}
+
+int handle_sharer_query(const message_t *msg) {
+    page_id_t page_id = msg->payload.sharer_query.page_id;
+    node_id_t requester = msg->payload.sharer_query.requester;
+
+    LOG_DEBUG("Received SHARER_QUERY for page %lu from node %u", page_id, requester);
+
+    /* Look up sharers in local directory */
+    page_directory_t *dir = get_page_directory();
+    node_id_t sharers[MAX_SHARERS];
+    int num_sharers = 0;
+
+    if (dir) {
+        directory_get_sharers(dir, page_id, sharers, &num_sharers);
+    }
+
+    /* Send reply with sharer list */
+    dsm_context_t *ctx = dsm_get_context();
+    message_t reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.header.magic = MSG_MAGIC;
+    reply.header.type = MSG_SHARER_REPLY;
+    reply.header.sender = ctx->node_id;
+    reply.payload.sharer_reply.page_id = page_id;
+    reply.payload.sharer_reply.num_sharers = num_sharers;
+    for (int i = 0; i < num_sharers && i < MAX_SHARERS; i++) {
+        reply.payload.sharer_reply.sharers[i] = sharers[i];
+    }
+
+    LOG_DEBUG("Sending SHARER_REPLY to node %u: page %lu has %d sharers",
+             requester, page_id, num_sharers);
+    return network_send(requester, &reply);
+}
+
+int handle_sharer_reply(const message_t *msg) {
+    page_id_t page_id = msg->payload.sharer_reply.page_id;
+    int num_sharers = msg->payload.sharer_reply.num_sharers;
+
+    LOG_DEBUG("Received SHARER_REPLY for page %lu: %d sharers", page_id, num_sharers);
+
+    /* Store in context for fetch_page_write to retrieve */
+    dsm_context_t *ctx = dsm_get_context();
+    pthread_mutex_lock(&ctx->network.sharer_tracker.lock);
+
+    if (ctx->network.sharer_tracker.active &&
+        ctx->network.sharer_tracker.page_id == page_id) {
+        ctx->network.sharer_tracker.num_sharers = num_sharers;
+        for (int i = 0; i < num_sharers && i < MAX_SHARERS; i++) {
+            ctx->network.sharer_tracker.sharers[i] = msg->payload.sharer_reply.sharers[i];
+        }
+        ctx->network.sharer_tracker.complete = true;
+        pthread_cond_signal(&ctx->network.sharer_tracker.cv);
+        LOG_DEBUG("Stored sharer list for page %lu in tracker", page_id);
+    }
+
+    pthread_mutex_unlock(&ctx->network.sharer_tracker.lock);
     return DSM_SUCCESS;
 }
 
@@ -1200,6 +1286,10 @@ int dispatch_message(const message_t *msg, int sockfd) {
             return handle_owner_update(msg);
         case MSG_NODE_FAILED:
             return handle_node_failed_msg(msg);
+        case MSG_SHARER_QUERY:
+            return handle_sharer_query(msg);
+        case MSG_SHARER_REPLY:
+            return handle_sharer_reply(msg);
         case MSG_NODE_LEAVE:
             LOG_INFO("Received NODE_LEAVE from node %u", msg->header.sender);
             return DSM_SUCCESS;
