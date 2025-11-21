@@ -514,7 +514,12 @@ int send_barrier_release(node_id_t node, barrier_id_t barrier_id) {
     msg.payload.barrier_release.barrier_id = barrier_id;
     msg.payload.barrier_release.num_arrived = 0;
 
-    return network_send(node, &msg);
+    LOG_INFO("Sending BARRIER_RELEASE for barrier %lu to node %u", barrier_id, node);
+    int rc = network_send(node, &msg);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to send BARRIER_RELEASE to node %u (rc=%d)", node, rc);
+    }
+    return rc;
 }
 
 int handle_barrier_arrive(const message_t *msg) {
@@ -532,7 +537,8 @@ int handle_barrier_arrive(const message_t *msg) {
 
 int handle_barrier_release(const message_t *msg) {
     barrier_id_t barrier_id = msg->payload.barrier_release.barrier_id;
-    LOG_DEBUG("Received BARRIER_RELEASE for barrier %lu", barrier_id);
+    LOG_INFO("Received BARRIER_RELEASE for barrier %lu from node %u",
+             barrier_id, msg->header.sender);
 
     /* Forward to barrier handler (implemented in sync/barrier.c) */
     extern int barrier_handle_release(barrier_id_t barrier_id);
