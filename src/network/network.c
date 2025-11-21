@@ -252,6 +252,30 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             memcpy(buffer + offset, &msg->payload.error, sizeof(error_payload_t));
             offset += sizeof(error_payload_t);
             break;
+        case MSG_DIR_QUERY:
+            memcpy(buffer + offset, &msg->payload.dir_query, sizeof(dir_query_payload_t));
+            offset += sizeof(dir_query_payload_t);
+            break;
+        case MSG_DIR_REPLY:
+            memcpy(buffer + offset, &msg->payload.dir_reply, sizeof(dir_reply_payload_t));
+            offset += sizeof(dir_reply_payload_t);
+            break;
+        case MSG_OWNER_UPDATE:
+            memcpy(buffer + offset, &msg->payload.owner_update, sizeof(owner_update_payload_t));
+            offset += sizeof(owner_update_payload_t);
+            break;
+        case MSG_NODE_FAILED:
+            memcpy(buffer + offset, &msg->payload.node_failed, sizeof(node_failed_payload_t));
+            offset += sizeof(node_failed_payload_t);
+            break;
+        case MSG_SHARER_QUERY:
+            memcpy(buffer + offset, &msg->payload.sharer_query, sizeof(sharer_query_payload_t));
+            offset += sizeof(sharer_query_payload_t);
+            break;
+        case MSG_SHARER_REPLY:
+            memcpy(buffer + offset, &msg->payload.sharer_reply, sizeof(sharer_reply_payload_t));
+            offset += sizeof(sharer_reply_payload_t);
+            break;
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;
