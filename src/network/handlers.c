@@ -1091,21 +1091,29 @@ int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner)
 int handle_dir_query(const message_t *msg) {
     page_id_t page_id = msg->payload.dir_query.page_id;
     node_id_t requester = msg->payload.dir_query.requester;
-    
+
+    LOG_INFO("Received DIR_QUERY for page %lu from node %u", page_id, requester);
+
     page_directory_t *dir = get_page_directory();
-    node_id_t owner = 0; 
-    
+    node_id_t owner = 0;
+
     if (dir) {
-        directory_lookup(dir, page_id, &owner);
+        int rc = directory_lookup(dir, page_id, &owner);
+        LOG_INFO("Directory lookup for page %lu: owner=%u (rc=%d)", page_id, owner, rc);
+    } else {
+        LOG_WARN("No directory available for lookup");
     }
-    
+
+    LOG_INFO("Sending DIR_REPLY to node %u: page %lu owned by node %u", requester, page_id, owner);
     return send_dir_reply(requester, page_id, owner);
 }
 
 int handle_dir_reply(const message_t *msg) {
     page_id_t page_id = msg->payload.dir_reply.page_id;
     node_id_t owner = msg->payload.dir_reply.owner;
-    
+
+    LOG_INFO("Received DIR_REPLY for page %lu: owner=node %u", page_id, owner);
+
     dsm_context_t *ctx = dsm_get_context();
     pthread_mutex_lock(&ctx->network.dir_tracker.lock);
     
