@@ -454,7 +454,7 @@ int network_recv(int sockfd, message_t *msg) {
         ssize_t n = recv(sockfd, length_buf + total_read, 4 - total_read, 0);
         if (n <= 0) {
             if (n == 0) {
-                LOG_INFO("Connection closed");
+                LOG_DEBUG("Connection closed (sockfd=%d)", sockfd);
             } else {
                 LOG_ERROR("Recv failed reading length: %s", strerror(errno));
             }
@@ -483,7 +483,7 @@ int network_recv(int sockfd, message_t *msg) {
         ssize_t n = recv(sockfd, buffer + total_read, msg_len - total_read, 0);
         if (n <= 0) {
             if (n == 0) {
-                LOG_INFO("Connection closed while reading message");
+                LOG_DEBUG("Connection closed while reading message (sockfd=%d)", sockfd);
             } else {
                 LOG_ERROR("Recv failed reading message: %s", strerror(errno));
             }
