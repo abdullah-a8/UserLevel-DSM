@@ -404,7 +404,7 @@ int main(int argc, char *argv[]) {
     int node_id = -1;
     int num_nodes = 2;
     char manager_host[256] = "localhost";
-    int port = 17000;
+    int port = 5000;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
