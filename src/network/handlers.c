@@ -226,6 +226,18 @@ int handle_page_reply(const message_t *msg) {
         return DSM_ERROR_NOT_FOUND;
     }
 
+    /* CRITICAL FIX: Temporarily enable write access for memcpy
+     * The dispatcher thread handles PAGE_REPLY and must copy data into shared memory.
+     * If the page is in NO_ACCESS or READ_ONLY state, memcpy will trigger a write fault
+     * ON THE DISPATCHER THREAD, causing a deadlock (dispatcher can't receive its own replies).
+     * Solution: Temporarily grant write access, copy data, then set final permission. */
+    int rc = set_page_permission(entry->local_addr, PAGE_PERM_READ_WRITE);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to grant temporary write access for page %lu data copy", page_id);
+        page_table_release(owning_table);
+        return rc;
+    }
+
     /* Copy page data */
     memcpy(entry->local_addr, msg->payload.page_reply.data, PAGE_SIZE);
     entry->version = version;
@@ -236,7 +248,7 @@ int handle_page_reply(const message_t *msg) {
      * - WRITE access -> READ_WRITE permission (PROT_READ|PROT_WRITE)
      */
     page_perm_t permission = (access == ACCESS_READ) ? PAGE_PERM_READ : PAGE_PERM_READ_WRITE;
-    int rc = set_page_permission(entry->local_addr, permission);
+    rc = set_page_permission(entry->local_addr, permission);
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to set page %lu permission to %s",
                   page_id, permission == PAGE_PERM_READ ? "READ" : "READ_WRITE");
