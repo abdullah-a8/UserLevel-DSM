@@ -1070,8 +1070,13 @@ int send_dir_query(node_id_t manager, page_id_t page_id) {
     msg.header.sender = ctx->node_id;
     msg.payload.dir_query.page_id = page_id;
     msg.payload.dir_query.requester = ctx->node_id;
-    
-    return network_send(manager, &msg);
+
+    LOG_INFO("Sending DIR_QUERY to node %u for page %lu", manager, page_id);
+    int rc = network_send(manager, &msg);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to send DIR_QUERY to node %u (rc=%d)", manager, rc);
+    }
+    return rc;
 }
 
 int send_dir_reply(node_id_t requester, page_id_t page_id, node_id_t owner) {
