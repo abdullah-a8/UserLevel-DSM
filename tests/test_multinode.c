@@ -239,6 +239,9 @@ void test_read_sharing(int node_id, int num_nodes) {
         dsm_barrier(2000, num_nodes);
     }
 
+    /* CRITICAL: Final barrier before cleanup */
+    dsm_barrier(2001, num_nodes);
+
     dsm_free(shared_data);
 }
 
