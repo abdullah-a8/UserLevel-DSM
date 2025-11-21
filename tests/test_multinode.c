@@ -168,6 +168,9 @@ void test_producer_consumer(int node_id, int num_nodes) {
         printf("[Node %d] ✓ Producer-consumer test PASSED\n", node_id);
     }
 
+    /* CRITICAL: Final barrier before cleanup */
+    dsm_barrier(21, num_nodes);
+
     dsm_lock_destroy(lock);
     dsm_free(buffer);
     dsm_free(count);
