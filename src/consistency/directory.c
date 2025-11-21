@@ -439,8 +439,9 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     /* If not manager, query manager via network */
     pthread_mutex_lock(&ctx->network.dir_tracker.lock);
 
-    LOG_INFO("Querying directory for page %lu (active=%d, complete=%d)",
-             page_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete);
+    LOG_INFO("Querying directory for page %lu (active=%d, complete=%d) from thread %d",
+             page_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete,
+             (int)pthread_self());
 
     /* Setup tracker */
     ctx->network.dir_tracker.page_id = page_id;

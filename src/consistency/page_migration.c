@@ -51,6 +51,8 @@ int fetch_page_read(page_id_t page_id) {
     dsm_context_t *ctx = dsm_get_context();
     int final_result = DSM_SUCCESS;
 
+    LOG_INFO("fetch_page_read called for page %lu by thread %d", page_id, (int)pthread_self());
+
     if (!ctx || ctx->num_allocations == 0 || !g_directory) {
         LOG_ERROR("DSM not initialized");
         return DSM_ERROR_INIT;
@@ -290,6 +292,8 @@ cleanup:
 int fetch_page_write(page_id_t page_id) {
     dsm_context_t *ctx = dsm_get_context();
     int final_result = DSM_SUCCESS;
+
+    LOG_INFO("fetch_page_write called for page %lu by thread %d", page_id, (int)pthread_self());
 
     if (!ctx || ctx->num_allocations == 0 || !g_directory) {
         LOG_ERROR("DSM not initialized");
