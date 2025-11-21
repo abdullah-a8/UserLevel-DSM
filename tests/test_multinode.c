@@ -96,6 +96,9 @@ void test_ping_pong(int node_id, int num_nodes) {
         dsm_barrier(1001, num_nodes);
     }
 
+    /* CRITICAL: Final barrier before cleanup to ensure all nodes complete all operations */
+    dsm_barrier(1002, num_nodes);
+
     dsm_free(shared_value);
 }
 
