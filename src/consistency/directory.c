@@ -439,6 +439,9 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     /* If not manager, query manager via network */
     pthread_mutex_lock(&ctx->network.dir_tracker.lock);
 
+    LOG_INFO("Querying directory for page %lu (active=%d, complete=%d)",
+             page_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete);
+
     /* Setup tracker */
     ctx->network.dir_tracker.page_id = page_id;
     ctx->network.dir_tracker.active = true;
@@ -447,10 +450,13 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     /* Send query */
     int rc = send_dir_query(0, page_id);
     if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to send DIR_QUERY for page %lu", page_id);
         ctx->network.dir_tracker.active = false;
         pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
         return rc;
     }
+
+    LOG_INFO("Waiting for DIR_REPLY for page %lu...", page_id);
 
     /* Wait for reply */
     struct timespec timeout;
@@ -461,7 +467,8 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
         rc = pthread_cond_timedwait(&ctx->network.dir_tracker.cv,
                                    &ctx->network.dir_tracker.lock, &timeout);
         if (rc == ETIMEDOUT) {
-            LOG_ERROR("Timeout querying directory manager for page %lu", page_id);
+            LOG_ERROR("Timeout querying directory manager for page %lu (active=%d, complete=%d)",
+                      page_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete);
             ctx->network.dir_tracker.active = false;
             pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
             return DSM_ERROR_TIMEOUT;
@@ -469,6 +476,7 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     }
 
     *owner = ctx->network.dir_tracker.owner;
+    LOG_INFO("DIR_QUERY complete for page %lu: owner=node %u", page_id, *owner);
     ctx->network.dir_tracker.active = false;
 
     pthread_mutex_unlock(&ctx->network.dir_tracker.lock);
