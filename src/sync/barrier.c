@@ -204,7 +204,9 @@ int barrier_manager_arrive(barrier_id_t barrier_id, node_id_t arriver, int num_p
                  barrier->arrived_count, barrier_id);
 
         /* Broadcast release to all nodes (including the one that just arrived) */
-        for (int i = 0; i < ctx->network.num_nodes; i++) {
+        /* CRITICAL FIX: Use MAX_NODES not num_nodes, since nodes are indexed by node_id
+         * not sequentially. If node_id=1 but num_nodes=1, loop would only check index 0. */
+        for (int i = 0; i < MAX_NODES; i++) {
             if (ctx->network.nodes[i].connected && ctx->network.nodes[i].id != ctx->node_id) {
                 send_barrier_release(ctx->network.nodes[i].id, barrier_id);
             }
