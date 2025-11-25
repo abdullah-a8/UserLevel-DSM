@@ -462,7 +462,7 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     /* Wait for reply */
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 1; /* 1 second timeout */
+    timeout.tv_sec += 5; /* 5 second timeout (increased for WAN scenarios) */
 
     while (!ctx->network.dir_tracker.complete) {
         rc = pthread_cond_timedwait(&ctx->network.dir_tracker.cv,
