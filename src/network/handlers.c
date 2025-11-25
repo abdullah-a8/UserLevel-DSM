@@ -677,6 +677,47 @@ int handle_alloc_notify(const message_t *msg) {
     LOG_INFO("SVAS setup complete: local addr=%p maps to remote pages %lu-%lu (owner=node %u)",
              addr, start_page_id, end_page_id, owner);
 
+    /* CRITICAL FIX #4: Manager forwards ALLOC_NOTIFY to all other workers
+     * This enables multi-node (3+) configurations where workers allocate their own partitions.
+     * Without forwarding, workers only notify the manager, so other workers never learn
+     * about the allocation and dsm_get_allocation() fails.
+     *
+     * Star topology: Workers only connect to manager, not to each other.
+     * When worker N allocates, it sends ALLOC_NOTIFY only to manager (node 0).
+     * Manager must forward to all other workers so they can create SVAS mappings.
+     */
+    node_id_t sender = msg->header.sender;
+    if (ctx->config.is_manager && sender != ctx->node_id) {
+        LOG_INFO("Manager forwarding ALLOC_NOTIFY from node %u to other workers", sender);
+
+        /* Forward to all connected workers except sender and self */
+        int forwarded = 0;
+        for (int i = 0; i < MAX_NODES; i++) {
+            pthread_mutex_lock(&ctx->lock);
+            bool connected = ctx->network.nodes[i].connected;
+            node_id_t target_id = ctx->network.nodes[i].id;
+            pthread_mutex_unlock(&ctx->lock);
+
+            if (connected && target_id != ctx->node_id && target_id != sender) {
+                LOG_INFO("Forwarding ALLOC_NOTIFY to node %u (pages %lu-%lu, owner=%u)",
+                         target_id, start_page_id, end_page_id, owner);
+
+                /* Create a copy of the message to forward (preserve original sender) */
+                message_t forward_msg;
+                memcpy(&forward_msg, msg, sizeof(message_t));
+
+                int rc = network_send(target_id, &forward_msg);
+                if (rc != DSM_SUCCESS) {
+                    LOG_WARN("Failed to forward ALLOC_NOTIFY to node %u", target_id);
+                } else {
+                    forwarded++;
+                }
+            }
+        }
+
+        LOG_INFO("Manager forwarded ALLOC_NOTIFY to %d workers", forwarded);
+    }
+
     /* CRITICAL FIX #1: Send ALLOC_ACK to allocation owner after SVAS setup */
     return send_alloc_ack(owner, start_page_id, end_page_id);
 }
