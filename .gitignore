@@ -9,7 +9,6 @@ build/
 # Compiled executables
 dsm_manager
 dsm_worker
-game_of_life
 
 # Editor/IDE files
 .vscode/
