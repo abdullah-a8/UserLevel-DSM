@@ -44,7 +44,7 @@ DEMO_BIN = $(patsubst $(DEMO_DIR)/%.c,$(BUILD_DIR)/%,$(DEMO_SRC))
 LIB = $(BUILD_DIR)/libdsm.a
 
 # Targets
-.PHONY: all clean test demo help test-tsan test-valgrind test-all build-tests
+.PHONY: all clean test demo help test-tsan test-valgrind test-all build-tests pretty-test
 
 all: $(LIB)
 
@@ -81,6 +81,20 @@ test: $(LIB) $(TEST_BIN)
 
 $(BUILD_DIR)/test_%: $(TEST_DIR)/%.c $(LIB)
 	@echo "Building test: $@..."
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -ldsm $(LDFLAGS) -o $@
+
+# Pretty presentation test (standalone build)
+pretty-test: $(LIB) $(BUILD_DIR)/test_multinode_pretty
+	@echo ""
+	@echo "Pretty multi-node test built: $(BUILD_DIR)/test_multinode_pretty"
+	@echo ""
+	@echo "Usage:"
+	@echo "  Manager: $(BUILD_DIR)/test_multinode_pretty --manager --nodes 2"
+	@echo "  Worker:  $(BUILD_DIR)/test_multinode_pretty --worker --node-id 1 --manager-host <IP>"
+	@echo ""
+
+$(BUILD_DIR)/test_multinode_pretty: $(TEST_DIR)/test_multinode_pretty.c $(LIB)
+	@echo "Building pretty presentation test..."
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -ldsm $(LDFLAGS) -o $@
 
 # ThreadSanitizer tests
@@ -185,6 +199,7 @@ help:
 	@echo "  all          - Build DSM library (default)"
 	@echo "  build-tests  - Build test binaries without running them"
 	@echo "  test         - Build and run all tests"
+	@echo "  pretty-test  - Build pretty presentation test (for demos)"
 	@echo "  test-tsan    - Run tests with ThreadSanitizer (race condition detection)"
 	@echo "  test-valgrind- Run tests with Valgrind (memory leak detection)"
 	@echo "  test-all     - Run all tests (regular + TSAN + Valgrind)"
@@ -196,6 +211,7 @@ help:
 	@echo "Example usage:"
 	@echo "  make              # Build library"
 	@echo "  make build-tests  # Build test binaries (for deployment)"
+	@echo "  make pretty-test  # Build pretty presentation test"
 	@echo "  make test         # Build and run tests"
 	@echo "  make test-tsan    # Check for race conditions"
 	@echo "  make test-valgrind# Check for memory leaks"
