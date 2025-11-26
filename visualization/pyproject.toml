@@ -1,0 +1,13 @@
+[project]
+name = "visualization"
+version = "0.1.0"
+description = "Visual Game of Life with DSM Overlay"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.5",
+    "pygame>=2.6.1",
+]
+
+[project.scripts]
+dsm-viz = "dsm_visualizer.main:main"

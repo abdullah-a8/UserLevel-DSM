@@ -157,6 +157,9 @@ int main(int argc, char *argv[]) {
     gol_state_t state;
     int rc;
 
+    /* Disable stdout buffering for real-time output to visualizer */
+    setbuf(stdout, NULL);
+
     /* Parse arguments */
     if (parse_arguments(argc, argv, &config) != 0) {
         print_usage(argv[0]);
@@ -167,6 +170,7 @@ int main(int argc, char *argv[]) {
     printf("Configuration:\n");
     printf("  Grid: %dx%d\n", config.grid_width, config.grid_height);
     printf("  Generations: %d\n", config.num_generations);
+    printf("  Display interval: %d\n", config.display_interval);
     printf("  Pattern: %d\n", config.pattern);
     printf("  Nodes: %d (this node: %d, %s)\n",
            config.num_nodes, config.node_id, config.is_manager ? "manager" : "worker");
@@ -248,6 +252,11 @@ int main(int argc, char *argv[]) {
 
     /* PHASE 4: Main Generation Loop */
     printf("[Node %d] Starting %d generations...\n", config.node_id, config.num_generations);
+    fflush(stdout);  /* Ensure output is visible immediately */
+
+    /* Track stats for periodic reporting */
+    dsm_stats_t stats_prev;
+    dsm_get_stats(&stats_prev);
 
     for (int gen = 0; gen < config.num_generations; gen++) {
         /* Step 1: Compute next generation for this partition */
@@ -257,10 +266,32 @@ int main(int argc, char *argv[]) {
         /* Step 2: Barrier - all nodes must finish computing before swap */
         dsm_barrier(BARRIER_COMPUTE_BASE + gen, config.num_nodes);
 
-        /* Step 3: Status output (Node 0 only, periodic) */
-        if (config.node_id == 0 && (gen % 10 == 0 || gen == config.num_generations - 1)) {
+        /* Step 3: Status output (all nodes, using display_interval) */
+        int should_display = (config.display_interval > 0) && 
+                            (gen % config.display_interval == 0 || gen == config.num_generations - 1);
+        if (should_display) {
+            /* Get current stats for delta calculation */
+            dsm_stats_t stats_now;
+            dsm_get_stats(&stats_now);
+            
+            /* Output generation info */
             printf("[Node %d] Generation %d: %lu live cells in partition\n",
                    config.node_id, gen, live_cells);
+            
+            /* Output current page fault stats (cumulative since start) */
+            printf("[Node %d] Page faults: %lu (R: %lu, W: %lu)\n",
+                   config.node_id,
+                   stats_now.page_faults - stats_start.page_faults,
+                   stats_now.read_faults - stats_start.read_faults,
+                   stats_now.write_faults - stats_start.write_faults);
+            
+            /* Output network stats */
+            printf("[Node %d] Network: %.2f KB sent, %.2f KB received\n",
+                   config.node_id,
+                   (stats_now.network_bytes_sent - stats_start.network_bytes_sent) / 1024.0,
+                   (stats_now.network_bytes_received - stats_start.network_bytes_received) / 1024.0);
+            
+            fflush(stdout);  /* Ensure output is visible immediately for visualization */
         }
 
         /* Step 4: Swap partition buffers (pointer swap, no memory copy) */

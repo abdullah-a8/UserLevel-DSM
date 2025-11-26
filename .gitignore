@@ -6,6 +6,22 @@ build/
 *.dylib
 *.exe
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+*.egg
+.eggs/
+dist/
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+
 # Compiled executables
 dsm_manager
 dsm_worker
