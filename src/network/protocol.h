@@ -89,6 +89,7 @@ typedef struct {
     page_id_t page_id;         /**< Page ID */
     uint64_t version;          /**< Page version number */
     access_type_t access;      /**< Access type granted (READ or WRITE) */
+    node_id_t requester;       /**< Original requester (for manager proxying) */
     uint8_t data[PAGE_SIZE];   /**< Page data (4KB) */
 } __attribute__((packed)) page_reply_payload_t;
 

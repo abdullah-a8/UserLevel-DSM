@@ -554,14 +554,15 @@ static void* dispatcher_thread(void *arg) {
                 message_t msg;
                 int sockfd = fds[i].fd;
                 if (network_recv(sockfd, &msg) == DSM_SUCCESS) {
-                    /* Enhanced logging to track ALLOC_NOTIFY messages */
+                    /* Enhanced logging to track all messages */
                     if (msg.header.type == MSG_ALLOC_NOTIFY) {
                         LOG_INFO("DISPATCHER: Received ALLOC_NOTIFY from sender=%u (sockfd=%d, pages=%lu-%lu)",
                                  msg.header.sender, sockfd,
                                  msg.payload.alloc_notify.start_page_id,
                                  msg.payload.alloc_notify.end_page_id);
                     } else {
-                        LOG_DEBUG("Received message type=%d from sockfd=%d", msg.header.type, sockfd);
+                        LOG_INFO("DISPATCHER: Received message type=%d from sender=%u (sockfd=%d)",
+                                 msg.header.type, msg.header.sender, sockfd);
                     }
                     dispatch_message(&msg, sockfd);
                 }

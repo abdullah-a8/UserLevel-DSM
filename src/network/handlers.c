@@ -32,8 +32,24 @@ int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) 
     msg.payload.page_request.access = access;
     msg.payload.page_request.requester = ctx->node_id;
 
-    LOG_DEBUG("Sending PAGE_REQUEST for page %lu to node %u", page_id, owner);
-    return network_send(owner, &msg);
+    /* CRITICAL FIX #5: Workers send PAGE_REQUEST through manager (star topology)
+     * In star topology, workers are only connected to the manager, not to each other.
+     * When a worker needs a page from another worker:
+     * - Send the request to the manager (node 0)
+     * - Manager will proxy it to the actual owner
+     * - Owner will reply back through the manager
+     */
+    node_id_t target = owner;
+    if (!ctx->config.is_manager && owner != 0) {
+        /* Worker requesting from another worker: route through manager */
+        target = 0;  /* Send to manager */
+        LOG_DEBUG("Worker routing PAGE_REQUEST for page %lu (owner=node %u) through manager",
+                  page_id, owner);
+    }
+
+    LOG_DEBUG("Sending PAGE_REQUEST for page %lu to node %u (final owner=node %u)",
+              page_id, target, owner);
+    return network_send(target, &msg);
 }
 
 int handle_page_request(const message_t *msg) {
@@ -69,6 +85,44 @@ int handle_page_request(const message_t *msg) {
     pthread_mutex_unlock(&ctx->lock);
 
     if (!entry || !owning_table) {
+        /* CRITICAL FIX #5: Manager proxies PAGE_REQUEST to actual owner
+         * When manager receives PAGE_REQUEST for a page it doesn't own, forward it to the
+         * actual owner. This enables worker-to-worker page transfers in star topology.
+         * The original requester ID is preserved in the message, so the owner can reply
+         * directly back through the manager.
+         */
+        if (ctx->config.is_manager) {
+            /* Query directory to find the actual owner */
+            page_directory_t *dir = get_page_directory();
+            if (dir) {
+                node_id_t actual_owner = 0;
+                int lookup_rc = directory_lookup(dir, page_id, &actual_owner);
+
+                if (lookup_rc == DSM_SUCCESS &&
+                    actual_owner != ctx->node_id &&
+                    actual_owner < MAX_NODES) {
+
+                    LOG_INFO("Manager proxying PAGE_REQUEST for page %lu from node %u to actual owner node %u",
+                             page_id, requester, actual_owner);
+
+                    /* Forward the request to the actual owner
+                     * CRITICAL: Update sender to manager (node 0) so receiver accepts it */
+                    message_t forward_msg;
+                    memcpy(&forward_msg, msg, sizeof(message_t));
+                    forward_msg.header.sender = ctx->node_id;  /* Set sender to manager */
+
+                    int rc = network_send(actual_owner, &forward_msg);
+                    if (rc != DSM_SUCCESS) {
+                        LOG_ERROR("Failed to forward PAGE_REQUEST to node %u", actual_owner);
+                        return rc;
+                    }
+
+                    LOG_DEBUG("Successfully forwarded PAGE_REQUEST to node %u", actual_owner);
+                    return DSM_SUCCESS;
+                }
+            }
+        }
+
         LOG_ERROR("Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
@@ -81,8 +135,42 @@ int handle_page_request(const message_t *msg) {
     pthread_mutex_unlock(&owning_table->lock);
 
     if (current_state == PAGE_STATE_INVALID) {
-        LOG_ERROR("Cannot serve page %lu - page is INVALID (no longer owner)", page_id);
         page_table_release(owning_table);
+
+        /* CRITICAL FIX #6: Manager proxies PAGE_REQUEST for INVALID pages
+         * When manager has SVAS mapping for a worker's allocation, the page is INVALID
+         * in manager's table. Manager must proxy the request to the actual owner. */
+        if (ctx->config.is_manager) {
+            page_directory_t *dir = get_page_directory();
+            if (dir) {
+                node_id_t actual_owner = 0;
+                int lookup_rc = directory_lookup(dir, page_id, &actual_owner);
+
+                if (lookup_rc == DSM_SUCCESS &&
+                    actual_owner != ctx->node_id &&
+                    actual_owner < MAX_NODES) {
+
+                    LOG_INFO("Manager proxying PAGE_REQUEST for INVALID page %lu from node %u to actual owner node %u",
+                             page_id, requester, actual_owner);
+
+                    /* CRITICAL: Update sender to manager so receiver accepts it */
+                    message_t forward_msg;
+                    memcpy(&forward_msg, msg, sizeof(message_t));
+                    forward_msg.header.sender = ctx->node_id;  /* Set sender to manager */
+
+                    int rc = network_send(actual_owner, &forward_msg);
+                    if (rc != DSM_SUCCESS) {
+                        LOG_ERROR("Failed to forward PAGE_REQUEST to node %u (rc=%d)", actual_owner, rc);
+                        return rc;
+                    }
+
+                    LOG_INFO("Successfully forwarded PAGE_REQUEST for INVALID page %lu to node %u", page_id, actual_owner);
+                    return DSM_SUCCESS;
+                }
+            }
+        }
+
+        LOG_ERROR("Cannot serve page %lu - page is INVALID (no longer owner)", page_id);
         /* Send error message to requester */
         message_t err_msg;
         memset(&err_msg, 0, sizeof(err_msg));
@@ -183,24 +271,80 @@ int send_page_reply(node_id_t requester, page_id_t page_id, access_type_t access
     msg.payload.page_reply.page_id = page_id;
     msg.payload.page_reply.version = 0;
     msg.payload.page_reply.access = access;
+    msg.payload.page_reply.requester = requester;  /* CRITICAL FIX #5: Include requester for manager proxying */
     memcpy(msg.payload.page_reply.data, data, PAGE_SIZE);
 
-    LOG_DEBUG("Sending PAGE_REPLY for page %lu to node %u (access=%s)",
-              page_id, requester, access == ACCESS_READ ? "READ" : "WRITE");
-    return network_send(requester, &msg);
+    /* CRITICAL FIX #7: Workers send PAGE_REPLY through manager (star topology)
+     * In star topology, workers are only connected to the manager, not to each other.
+     * When a worker needs to reply to another worker:
+     * - Send the reply to the manager (node 0)
+     * - Manager will proxy it to the actual requester
+     * - The requester field in the message tells the manager where to forward it
+     */
+    node_id_t target = requester;
+    if (!ctx->config.is_manager && requester != 0) {
+        /* Worker replying to another worker: route through manager */
+        target = 0;  /* Send to manager */
+        LOG_DEBUG("Worker routing PAGE_REPLY for page %lu (requester=node %u) through manager",
+                  page_id, requester);
+    }
+
+    LOG_DEBUG("Sending PAGE_REPLY for page %lu to node %u (final requester=node %u, access=%s)",
+              page_id, target, requester, access == ACCESS_READ ? "READ" : "WRITE");
+    return network_send(target, &msg);
 }
 
 int handle_page_reply(const message_t *msg) {
     page_id_t page_id = msg->payload.page_reply.page_id;
     uint64_t version = msg->payload.page_reply.version;
     access_type_t access = msg->payload.page_reply.access;
+    node_id_t sender = msg->header.sender;
+    node_id_t requester = msg->payload.page_reply.requester;
 
-    LOG_DEBUG("Handling PAGE_REPLY for page %lu (version %lu, access=%s)",
-              page_id, version, access == ACCESS_READ ? "READ" : "WRITE");
+    LOG_INFO("HANDLER: Handling PAGE_REPLY for page %lu (version %lu, access=%s) from sender=%u, requester=%u",
+              page_id, version, access == ACCESS_READ ? "READ" : "WRITE", sender, requester);
 
     dsm_context_t *ctx = dsm_get_context();
     if (ctx->num_allocations == 0) {
+        LOG_ERROR("HANDLER: PAGE_REPLY rejected - no allocations (page %lu)", page_id);
         return DSM_ERROR_INIT;
+    }
+
+    /* CRITICAL FIX #9: Manager must forward PAGE_REPLY to actual requester
+     * Check BEFORE searching local tables - if this reply is for another node,
+     * forward it immediately without local processing.
+     * The manager has remote page table entries for all allocations (due to ALLOC_NOTIFY),
+     * but these are just metadata - the manager doesn't actually need the page data.
+     */
+    if (ctx->config.is_manager && requester != ctx->node_id) {
+        /* Verify this is a valid forward scenario */
+        if (requester < MAX_NODES && requester != sender) {
+            LOG_INFO("HANDLER: Manager forwarding PAGE_REPLY for page %lu from node %u to requester node %u",
+                     page_id, sender, requester);
+
+            pthread_mutex_lock(&ctx->lock);
+            bool target_connected = ctx->network.nodes[requester].connected;
+            pthread_mutex_unlock(&ctx->lock);
+
+            if (!target_connected) {
+                LOG_ERROR("HANDLER: Cannot forward PAGE_REPLY: requester node %u not connected", requester);
+                return DSM_ERROR_NETWORK;
+            }
+
+            /* Forward with manager as sender */
+            message_t forward_msg;
+            memcpy(&forward_msg, msg, sizeof(message_t));
+            forward_msg.header.sender = ctx->node_id;
+
+            int rc = network_send(requester, &forward_msg);
+            if (rc != DSM_SUCCESS) {
+                LOG_ERROR("HANDLER: Failed to forward PAGE_REPLY to node %u (rc=%d)", requester, rc);
+                return rc;
+            }
+
+            LOG_INFO("HANDLER: Successfully forwarded PAGE_REPLY for page %lu to node %u", page_id, requester);
+            return DSM_SUCCESS;
+        }
     }
 
     /* Search all page tables for this page ID
@@ -222,9 +366,60 @@ int handle_page_reply(const message_t *msg) {
     pthread_mutex_unlock(&ctx->lock);
 
     if (!entry || !owning_table) {
-        LOG_ERROR("Page %lu not found in any page table", page_id);
+        LOG_INFO("HANDLER: Page %lu not found in local tables (is_manager=%d, requester=%u)",
+                 page_id, ctx->config.is_manager, msg->payload.page_reply.requester);
+
+        /* CRITICAL FIX #5: Manager proxies PAGE_REPLY to actual requester
+         * When manager receives PAGE_REPLY for a page it doesn't need, this is likely
+         * a response to a proxied PAGE_REQUEST. The manager should forward it to the
+         * original requester (extracted from page_reply.requester field).
+         *
+         * Flow: Node 1 -> Manager -> Node 2 (PAGE_REQUEST)
+         *       Node 2 -> Manager -> Node 1 (PAGE_REPLY)
+         */
+        if (ctx->config.is_manager) {
+            node_id_t original_requester = msg->payload.page_reply.requester;
+
+            /* Verify this is a valid forward scenario */
+            if (original_requester != ctx->node_id &&
+                original_requester != sender &&
+                original_requester < MAX_NODES) {
+
+                LOG_INFO("Manager proxying PAGE_REPLY for page %lu from node %u to original requester node %u",
+                         page_id, sender, original_requester);
+
+                /* Forward the reply to the original requester
+                 * CRITICAL: Update sender to manager so receiver accepts it */
+                message_t forward_msg;
+                memcpy(&forward_msg, msg, sizeof(message_t));
+                forward_msg.header.sender = ctx->node_id;  /* Set sender to manager */
+
+                pthread_mutex_lock(&ctx->lock);
+                bool target_connected = ctx->network.nodes[original_requester].connected;
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (!target_connected) {
+                    LOG_ERROR("Cannot forward PAGE_REPLY: requester node %u not connected",
+                              original_requester);
+                    return DSM_ERROR_NETWORK;
+                }
+
+                int rc = network_send(original_requester, &forward_msg);
+                if (rc != DSM_SUCCESS) {
+                    LOG_ERROR("Failed to forward PAGE_REPLY to node %u", original_requester);
+                    return rc;
+                }
+
+                LOG_DEBUG("Successfully forwarded PAGE_REPLY to node %u", original_requester);
+                return DSM_SUCCESS;
+            }
+        }
+
+        LOG_ERROR("HANDLER: Page %lu not found in any page table", page_id);
         return DSM_ERROR_NOT_FOUND;
     }
+
+    LOG_INFO("HANDLER: Found page %lu in local table, copying data and waking waiters", page_id);
 
     /* CRITICAL FIX: Temporarily enable write access for memcpy
      * The dispatcher thread handles PAGE_REPLY and must copy data into shared memory.
@@ -266,9 +461,7 @@ int handle_page_reply(const message_t *msg) {
     pthread_cond_broadcast(&entry->ready_cv);  /* Wake ALL waiting threads */
     pthread_mutex_unlock(&entry->entry_lock);
 
-    if (waiters > 0) {
-        LOG_DEBUG("Woke %d waiting threads for page %lu", waiters, page_id);
-    }
+    LOG_INFO("HANDLER: Woke %d waiting threads for page %lu, request_pending set to false", waiters, page_id);
 
     page_table_release(owning_table);
     return DSM_SUCCESS;
@@ -736,10 +929,21 @@ int send_alloc_ack(node_id_t target, page_id_t start_page_id, page_id_t end_page
     msg.payload.alloc_ack.end_page_id = end_page_id;
     msg.payload.alloc_ack.acker = ctx->node_id;
 
-    LOG_DEBUG("Sending ALLOC_ACK to node %u for pages %lu-%lu",
-              target, start_page_id, end_page_id);
+    /* CRITICAL FIX #5: Workers send ALLOC_ACK through manager (star topology)
+     * Similar to PAGE_REQUEST routing, ALLOC_ACKs from workers to other workers
+     * must be routed through the manager since workers aren't directly connected.
+     */
+    node_id_t send_target = target;
+    if (!ctx->config.is_manager && target != 0) {
+        /* Worker acknowledging to another worker: route through manager */
+        send_target = 0;  /* Send to manager */
+        LOG_DEBUG("Worker routing ALLOC_ACK (target=node %u) through manager", target);
+    }
 
-    return network_send(target, &msg);
+    LOG_DEBUG("Sending ALLOC_ACK to node %u for pages %lu-%lu (final target=node %u)",
+              send_target, start_page_id, end_page_id, target);
+
+    return network_send(send_target, &msg);
 }
 
 int handle_alloc_ack(const message_t *msg) {
@@ -758,6 +962,39 @@ int handle_alloc_ack(const message_t *msg) {
     /* Check if we're tracking this allocation */
     if (!tracker->active) {
         pthread_mutex_unlock(&tracker->lock);
+
+        /* CRITICAL FIX #5: Manager proxies ALLOC_ACK to the allocator
+         * When manager receives ALLOC_ACK but isn't tracking it locally,
+         * this means a worker allocated and is waiting for ACKs.
+         * Forward the ACK to the page owner (the allocator).
+         */
+        if (ctx->config.is_manager) {
+            /* Look up who owns these pages */
+            page_directory_t *dir = get_page_directory();
+            if (dir) {
+                node_id_t page_owner = 0;
+                int lookup_rc = directory_lookup(dir, start_page_id, &page_owner);
+
+                if (lookup_rc == DSM_SUCCESS &&
+                    page_owner != ctx->node_id &&
+                    page_owner < MAX_NODES) {
+
+                    LOG_INFO("Manager proxying ALLOC_ACK from node %u to allocator node %u (pages %lu-%lu)",
+                             acker, page_owner, start_page_id, end_page_id);
+
+                    /* Forward the ACK to the allocator */
+                    message_t forward_msg;
+                    memcpy(&forward_msg, msg, sizeof(message_t));
+
+                    int rc = network_send(page_owner, &forward_msg);
+                    if (rc != DSM_SUCCESS) {
+                        LOG_ERROR("Failed to forward ALLOC_ACK to node %u", page_owner);
+                    }
+                    return DSM_SUCCESS;
+                }
+            }
+        }
+
         LOG_WARN("Received ALLOC_ACK but no allocation is being tracked");
         return DSM_SUCCESS;
     }
