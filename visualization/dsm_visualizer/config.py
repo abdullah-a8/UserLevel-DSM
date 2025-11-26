@@ -4,49 +4,68 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 # ==============================================================================
-# Color Scheme (Colorblind-friendly)
+# Color Scheme (Modern, Polished)
 # ==============================================================================
 
 # Node colors - each node gets a distinct color for its partition
 NODE_COLORS: list[Tuple[int, int, int]] = [
-    (66, 133, 244),  # Node 0: Blue
-    (52, 168, 83),  # Node 1: Green
-    (251, 188, 4),  # Node 2: Yellow
-    (234, 67, 53),  # Node 3: Red
+    (79, 172, 254),  # Node 0: Sky Blue
+    (67, 217, 173),  # Node 1: Mint Green
+    (255, 209, 102),  # Node 2: Golden Yellow
+    (255, 107, 129),  # Node 3: Coral Red
 ]
 
-# Alive cell colors (brighter versions of node colors)
+# Alive cell colors (vibrant versions of node colors)
 NODE_ALIVE_COLORS: list[Tuple[int, int, int]] = [
-    (100, 160, 255),  # Node 0: Bright Blue
-    (80, 200, 120),  # Node 1: Bright Green
-    (255, 210, 80),  # Node 2: Bright Yellow
-    (255, 100, 100),  # Node 3: Bright Red
+    (99, 179, 237),  # Node 0: Bright Sky Blue
+    (72, 207, 173),  # Node 1: Bright Mint
+    (255, 215, 94),  # Node 2: Bright Gold
+    (255, 118, 117),  # Node 3: Bright Coral
 ]
 
-# Dead cell colors (dimmed versions of node colors)
+# Dead cell colors (rich dark versions of node colors)
 NODE_DEAD_COLORS: list[Tuple[int, int, int]] = [
-    (20, 40, 80),  # Node 0: Dark Blue
-    (15, 50, 30),  # Node 1: Dark Green
-    (60, 50, 20),  # Node 2: Dark Yellow
-    (60, 25, 25),  # Node 3: Dark Red
+    (26, 54, 93),  # Node 0: Deep Blue
+    (22, 66, 60),  # Node 1: Deep Teal
+    (77, 61, 28),  # Node 2: Deep Amber
+    (87, 35, 45),  # Node 3: Deep Rose
+]
+
+# Accent colors for UI elements (matching node themes)
+NODE_ACCENT_COLORS: list[Tuple[int, int, int]] = [
+    (59, 130, 246),  # Node 0: Blue accent
+    (16, 185, 129),  # Node 1: Green accent
+    (245, 158, 11),  # Node 2: Amber accent
+    (239, 68, 68),  # Node 3: Red accent
 ]
 
 # UI Colors
-BACKGROUND_COLOR: Tuple[int, int, int] = (20, 20, 20)
-STATS_PANEL_BG: Tuple[int, int, int] = (30, 30, 40)
-BOUNDARY_COLOR: Tuple[int, int, int] = (255, 100, 100)
-FAULT_FLASH_COLOR: Tuple[int, int, int] = (255, 255, 0)
-TEXT_COLOR: Tuple[int, int, int] = (220, 220, 220)
+BACKGROUND_COLOR: Tuple[int, int, int] = (15, 15, 20)
+STATS_PANEL_BG: Tuple[int, int, int] = (22, 24, 32)
+STATS_PANEL_CARD_BG: Tuple[int, int, int] = (32, 34, 45)
+STATS_PANEL_HEADER_BG: Tuple[int, int, int] = (38, 40, 55)
+BOUNDARY_COLOR: Tuple[int, int, int] = (180, 80, 80)
+FAULT_FLASH_COLOR: Tuple[int, int, int] = (255, 235, 59)
+TEXT_COLOR: Tuple[int, int, int] = (200, 205, 215)
+TEXT_DIM_COLOR: Tuple[int, int, int] = (140, 145, 160)
 TEXT_HIGHLIGHT_COLOR: Tuple[int, int, int] = (255, 255, 255)
+ACCENT_COLOR: Tuple[int, int, int] = (99, 179, 237)
+SUCCESS_COLOR: Tuple[int, int, int] = (72, 207, 173)
+WARNING_COLOR: Tuple[int, int, int] = (255, 215, 94)
+SEPARATOR_COLOR: Tuple[int, int, int] = (50, 55, 70)
 
 # ==============================================================================
 # Layout Constants
 # ==============================================================================
 
-STATS_PANEL_WIDTH: int = 280
-DEFAULT_CELL_SIZE: int = 10
+STATS_PANEL_WIDTH: int = 320
+DEFAULT_CELL_SIZE: int = 12  # Slightly larger for better visibility
 MIN_CELL_SIZE: int = 4
 MAX_CELL_SIZE: int = 20
+CELL_BORDER_RADIUS: int = 2
+CARD_BORDER_RADIUS: int = 8
+PANEL_PADDING: int = 16
+CARD_PADDING: int = 12
 
 # ==============================================================================
 # Animation Constants
@@ -103,11 +122,8 @@ class VisualizerConfig:
 
     @property
     def window_height(self) -> int:
-        """Total window height."""
-        # Calculate minimum height based on number of nodes
-        # Each node needs ~160px, plus header(80) + totals(120) + controls(130)
-        min_for_stats = 80 + (self.num_nodes * 160) + 120 + 130
-        return max(self.grid_pixel_height, min_for_stats)
+        """Total window height - matches grid height exactly."""
+        return self.grid_pixel_height
 
 
 @dataclass

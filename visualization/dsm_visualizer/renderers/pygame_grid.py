@@ -8,10 +8,16 @@ from dsm_visualizer.config import (
     VisualizerConfig,
     NODE_ALIVE_COLORS,
     NODE_DEAD_COLORS,
+    NODE_ACCENT_COLORS,
     BACKGROUND_COLOR,
     BOUNDARY_COLOR,
     FAULT_FLASH_COLOR,
     FAULT_FLASH_FRAMES,
+    STATS_PANEL_WIDTH,
+    SEPARATOR_COLOR,
+    TEXT_HIGHLIGHT_COLOR,
+    TEXT_DIM_COLOR,
+    ACCENT_COLOR,
 )
 from dsm_visualizer.models.grid_state import GridState
 from dsm_visualizer.models.dsm_stats import DSMStats
@@ -36,9 +42,9 @@ class PygameGridRenderer:
 
     Features:
     - Cells colored by partition owner
-    - Partition boundary lines
+    - Partition boundary lines with glow effect
     - Page fault flash animations
-    - Stats panel sidebar
+    - Modern stats panel sidebar
     """
 
     def __init__(self, config: VisualizerConfig):
@@ -65,7 +71,7 @@ class PygameGridRenderer:
             self.stats_panel = StatsPanel(
                 self.screen,
                 x_offset=config.grid_pixel_width,
-                width=280,
+                width=STATS_PANEL_WIDTH,
                 height=config.window_height,
             )
         else:
@@ -79,6 +85,11 @@ class PygameGridRenderer:
 
         # Pre-render surfaces for efficiency (optional optimization)
         self.clock = pygame.time.Clock()
+
+        # Create grid surface for smoother rendering
+        self.grid_surface = pygame.Surface(
+            (config.grid_pixel_width, config.grid_pixel_height)
+        )
 
     def render(
         self,
@@ -121,6 +132,10 @@ class PygameGridRenderer:
                     result.speed_up = True
                 elif event.key == pygame.K_DOWN or event.key == pygame.K_MINUS:
                     result.speed_down = True
+            elif event.type == pygame.MOUSEWHEEL:
+                # Pass scroll events to stats panel
+                if self.stats_panel:
+                    self.stats_panel.handle_scroll(event)
 
         # Clear screen
         self.screen.fill(BACKGROUND_COLOR)
@@ -154,18 +169,42 @@ class PygameGridRenderer:
         return result
 
     def _draw_pause_overlay(self, grid: GridState) -> None:
-        """Draw a semi-transparent pause indicator."""
+        """Draw a semi-transparent pause indicator with modern styling."""
         # Create overlay surface
         overlay = pygame.Surface(
             (self.config.grid_pixel_width, self.config.grid_pixel_height),
             pygame.SRCALPHA,
         )
-        overlay.fill((0, 0, 0, 100))  # Semi-transparent black
+        overlay.fill((15, 15, 20, 180))  # Semi-transparent dark
         self.screen.blit(overlay, (0, 0))
 
-        # Draw "PAUSED" text
+        # Draw "PAUSED" text with glow effect
         font = pygame.font.SysFont("monospace", 48, bold=True)
-        text = font.render("PAUSED", True, (255, 255, 255))
+
+        # Glow effect (draw text multiple times with slight offset)
+        glow_color = (*ACCENT_COLOR, 60)
+        for dx, dy in [
+            (-2, -2),
+            (2, -2),
+            (-2, 2),
+            (2, 2),
+            (0, -3),
+            (0, 3),
+            (-3, 0),
+            (3, 0),
+        ]:
+            glow_text = font.render("PAUSED", True, glow_color[:3])
+            glow_text.set_alpha(60)
+            glow_rect = glow_text.get_rect(
+                center=(
+                    self.config.grid_pixel_width // 2 + dx,
+                    self.config.grid_pixel_height // 2 + dy,
+                )
+            )
+            self.screen.blit(glow_text, glow_rect)
+
+        # Main text
+        text = font.render("PAUSED", True, TEXT_HIGHLIGHT_COLOR)
         text_rect = text.get_rect(
             center=(
                 self.config.grid_pixel_width // 2,
@@ -175,35 +214,25 @@ class PygameGridRenderer:
         self.screen.blit(text, text_rect)
 
         # Draw hint text
-        hint_font = pygame.font.SysFont("monospace", 16)
+        hint_font = pygame.font.SysFont("monospace", 14)
         hint = hint_font.render(
-            "Press SPACE to resume, N to step", True, (200, 200, 200)
+            "Press SPACE to resume, N to step", True, TEXT_DIM_COLOR
         )
         hint_rect = hint.get_rect(
             center=(
                 self.config.grid_pixel_width // 2,
-                self.config.grid_pixel_height // 2 + 40,
+                self.config.grid_pixel_height // 2 + 45,
             )
         )
         self.screen.blit(hint, hint_rect)
 
     def _draw_cells(self, grid: GridState) -> None:
-        """Draw all cells with partition-based coloring."""
-        # First, fill any extra space below grid with last partition's dead color
-        grid_pixel_height = grid.height * self.cell_size
-        if self.config.window_height > grid_pixel_height:
-            last_owner = grid.num_nodes - 1
-            fill_color = NODE_DEAD_COLORS[last_owner % len(NODE_DEAD_COLORS)]
-            pygame.draw.rect(
-                self.screen,
-                fill_color,
-                (
-                    0,
-                    grid_pixel_height,
-                    self.config.grid_pixel_width,
-                    self.config.window_height - grid_pixel_height,
-                ),
-            )
+        """Draw all cells with partition-based coloring and subtle styling."""
+        # Fill grid surface with background
+        self.grid_surface.fill(BACKGROUND_COLOR)
+
+        cell_gap = 1  # Gap between cells for grid effect
+        cell_draw_size = self.cell_size - cell_gap
 
         # Draw all cells
         for row in range(grid.height):
@@ -218,46 +247,102 @@ class PygameGridRenderer:
                 # Choose color based on cell state
                 if grid.cells[row, col] == 1:
                     color = alive_color
+                    # Draw alive cells with slight glow effect
+                    pygame.draw.rect(
+                        self.grid_surface,
+                        color,
+                        (x, y, cell_draw_size, cell_draw_size),
+                        border_radius=2,
+                    )
                 else:
                     color = dead_color
+                    # Draw dead cells flat
+                    pygame.draw.rect(
+                        self.grid_surface,
+                        color,
+                        (x, y, cell_draw_size, cell_draw_size),
+                        border_radius=1,
+                    )
 
-                # Draw cell (with 1px gap for grid effect)
-                pygame.draw.rect(
-                    self.screen,
-                    color,
-                    (x, y, self.cell_size - 1, self.cell_size - 1),
-                )
+        # Blit grid surface to screen
+        self.screen.blit(self.grid_surface, (0, 0))
 
     def _draw_partition_boundaries(self, grid: GridState) -> None:
-        """Draw lines at partition boundaries."""
+        """Draw lines at partition boundaries with subtle glow effect."""
         for i, (start, end) in enumerate(grid.partition_boundaries):
             if i > 0:  # Don't draw at top of first partition
                 y = start * self.cell_size
+
+                # Get colors for adjacent partitions
+                color_above = NODE_ACCENT_COLORS[(i - 1) % len(NODE_ACCENT_COLORS)]
+                color_below = NODE_ACCENT_COLORS[i % len(NODE_ACCENT_COLORS)]
+
+                # Draw glow effect (softer lines around the main boundary)
+                glow_surface = pygame.Surface(
+                    (grid.width * self.cell_size, 7), pygame.SRCALPHA
+                )
+                # Upper glow
+                pygame.draw.line(
+                    glow_surface,
+                    (*color_above, 40),
+                    (0, 0),
+                    (grid.width * self.cell_size, 0),
+                    1,
+                )
+                # Lower glow
+                pygame.draw.line(
+                    glow_surface,
+                    (*color_below, 40),
+                    (0, 6),
+                    (grid.width * self.cell_size, 6),
+                    1,
+                )
+                self.screen.blit(glow_surface, (0, y - 3))
+
+                # Main boundary line
                 pygame.draw.line(
                     self.screen,
-                    BOUNDARY_COLOR,
+                    SEPARATOR_COLOR,
                     (0, y),
                     (grid.width * self.cell_size, y),
-                    3,  # Line thickness
+                    2,
                 )
 
     def _draw_fault_highlights(self, grid: GridState) -> None:
-        """Draw yellow highlights for active page faults."""
+        """Draw animated highlights for active page faults with glow effect."""
         for (row, col), frames in self.active_faults.items():
-            if frames > 0:
+            if frames > 0 and row < grid.height and col < grid.width:
                 x = col * self.cell_size
                 y = row * self.cell_size
+                cell_draw_size = self.cell_size - 1
 
-                # Calculate alpha based on remaining frames
-                alpha = int(255 * (frames / FAULT_FLASH_FRAMES))
+                # Calculate alpha based on remaining frames (fade out)
+                progress = frames / FAULT_FLASH_FRAMES
+                alpha = int(200 * progress)
 
                 # Create a surface with alpha for the highlight
                 highlight = pygame.Surface(
-                    (self.cell_size - 1, self.cell_size - 1),
+                    (cell_draw_size + 4, cell_draw_size + 4),
                     pygame.SRCALPHA,
                 )
-                highlight.fill((*FAULT_FLASH_COLOR, alpha))
-                self.screen.blit(highlight, (x, y))
+
+                # Outer glow
+                pygame.draw.rect(
+                    highlight,
+                    (*FAULT_FLASH_COLOR, alpha // 3),
+                    (0, 0, cell_draw_size + 4, cell_draw_size + 4),
+                    border_radius=4,
+                )
+
+                # Inner highlight
+                pygame.draw.rect(
+                    highlight,
+                    (*FAULT_FLASH_COLOR, alpha),
+                    (2, 2, cell_draw_size, cell_draw_size),
+                    border_radius=2,
+                )
+
+                self.screen.blit(highlight, (x - 2, y - 2))
 
     def _update_fault_animations(self) -> None:
         """Decrement fault animation counters and remove finished ones."""
