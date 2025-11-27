@@ -1,463 +1,547 @@
-# DSM Architecture Documentation
+# User-Level DSM Architecture
+
+This document describes the architecture and implementation of the User-Level Distributed Shared Memory (DSM) system.
+
+## Overview
+
+This is a user-space implementation of Distributed Shared Memory that provides the illusion of a single shared address space across multiple machines. The system uses standard POSIX APIs (`mmap`, `mprotect`, `sigaction`) and TCP sockets to implement page-based memory coherence without requiring any kernel modifications.
+
+**Key Design Principles:**
+
+- **Page-level granularity**: 4KB pages as the unit of sharing
+- **Single Virtual Address Space (SVAS)**: All nodes map allocations at the same virtual addresses
+- **Single-Writer/Multiple-Reader**: Invalidation-based consistency protocol
+- **Centralized coordination**: Manager node (Node 0) handles lock/barrier coordination and directory management
+- **Lazy page migration**: Pages migrate on-demand via page faults
 
 ## System Architecture
 
-### High-Level Overview
+### Node Roles
+
+**Manager Node (Node 0):**
+
+- Runs TCP server accepting connections from workers
+- Maintains centralized page directory (ownership and sharer tracking)
+- Coordinates distributed locks and barriers
+- Broadcasts allocation notifications
+
+**Worker Nodes (Node 1+):**
+
+- Connect to manager via TCP client
+- Local page table tracking
+- Send page requests and receive data
+- Participate in synchronization
+
+### Core Components
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Application Layer                        │
-│  (User programs using DSM API: malloc, locks, barriers)    │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-┌────────────────────┴────────────────────────────────────────┐
-│                    DSM API Layer                            │
-│  dsm_init(), dsm_malloc(), dsm_lock_*(), dsm_barrier()     │
-└────┬────────┬──────────┬──────────┬─────────────────────────┘
-     │        │          │          │
-┌────▼────┐ ┌▼────┐ ┌───▼───┐ ┌────▼─────┐
-│ Memory  │ │ Fault│ │Network│ │   Sync   │
-│ Manager │ │Handler│ │ Layer │ │ Primitives│
-└────┬────┘ └┬─────┘ └───┬───┘ └────┬─────┘
-     │       │           │          │
-┌────▼───────▼───────────▼──────────▼─────────────────────────┐
-│              Operating System (Linux)                        │
-│  mmap, mprotect, sigaction, socket, send/recv               │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    Application Layer                     │
+│              (dsm_malloc, locks, barriers)               │
+└──────────────────┬──────────────────────────────────────┘
+                   │
+┌──────────────────┴──────────────────────────────────────┐
+│                   DSM API (dsm.h)                        │
+│         dsm_init, dsm_malloc, dsm_lock, dsm_barrier      │
+└──────────────────┬──────────────────────────────────────┘
+                   │
+      ┌────────────┼────────────┐
+      │            │            │
+┌─────▼─────┐ ┌───▼────┐ ┌────▼──────┐
+│  Memory   │ │ Fault  │ │   Sync    │
+│  Manager  │ │Handler │ │ Primitives│
+└─────┬─────┘ └───┬────┘ └────┬──────┘
+      │           │            │
+      └───────────┼────────────┘
+                  │
+        ┌─────────▼─────────┐
+        │   Consistency     │
+        │ (Page Migration + │
+        │    Directory)     │
+        └─────────┬─────────┘
+                  │
+        ┌─────────▼─────────┐
+        │   Network Layer   │
+        │ (TCP + Protocol)  │
+        └───────────────────┘
 ```
 
-## Component Breakdown
+## Memory Management
 
-### 1. Memory Manager (`src/memory/`)
+### Allocation (`dsm_malloc`)
 
-**Responsibilities:**
-- Allocate DSM regions using `mmap`
-- Maintain page table mapping virtual addresses to pages
-- Track page ownership (which node owns which page)
-- Manage page permissions using `mprotect`
+**Process Flow:**
 
-**Key Data Structures:**
-```c
-page_table_t     - Maps virtual addresses to page entries
-page_entry_t     - Stores page state, owner, version
-```
+1. Round size up to page boundary
+2. Allocate memory region using `mmap(PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS)`
+   - Initially no access permissions (triggers faults on first access)
+3. Create page table tracking all pages in allocation
+4. Assign globally unique page IDs: `(node_id << 32) | (allocation_index << 16) | page_offset`
+5. Set this node as owner in local page table and directory
+6. Broadcast `ALLOC_NOTIFY` to all nodes with base address and page range
+7. Wait for `ALLOC_ACK` from all nodes before returning
 
-**Key Functions:**
-```c
-dsm_malloc()     - Allocate DSM memory
-page_table_*()   - Page table operations
-set_page_permission() - Change page protections
-```
+**Workers receiving ALLOC_NOTIFY:**
 
-### 2. Page Fault Handler (`src/memory/`)
+1. Create `mmap` at the **same virtual address** (SVAS requirement)
+2. Create remote page table with received page IDs
+3. Mark pages as owned by remote node
+4. Send `ALLOC_ACK` back
 
-**Responsibilities:**
-- Catch page faults via `SIGSEGV` signal
-- Determine fault type (read vs write)
-- Coordinate page fetch from remote node
-- Update page permissions after fetch
+**C Functions Used:**
 
-**Signal Handler Flow:**
-```
-SIGSEGV triggered
-    ↓
-Extract fault address (si_addr)
-    ↓
-Lookup page in page table
-    ↓
-Determine fault type (read/write)
-    ↓
-┌───────────────┐
-│ Read Fault?   │
-└───┬───────┬───┘
-    │       │
-   YES      NO (Write Fault)
-    │       │
-    ▼       ▼
-Fetch page  Fetch page + Invalidate others
-Read-only   Read-write
-    │       │
-    └───┬───┘
-        ↓
-Update mprotect permissions
-        ↓
-Return from signal handler
-```
+- `mmap()`: Allocate virtual address space
+- `munmap()`: Free pages on `dsm_free()`
+- Page tables track metadata per page
 
-### 3. Network Layer (`src/network/`)
+### Page Tables
 
-**Responsibilities:**
-- TCP server for accepting connections
-- TCP client for connecting to peers
-- Message serialization/deserialization
-- Reliable send/receive with error handling
+**Structure:** Array-based with linear lookup
 
-**Message Format:**
-```
-┌──────────────────────────────────────┐
-│      Message Header (32 bytes)       │
-├──────────────────────────────────────┤
-│ Magic (4B) | Type (4B) | Length (4B) │
-│ Sender (4B) | Seq# (8B) | Reserved   │
-├──────────────────────────────────────┤
-│         Payload (variable)           │
-│  (depends on message type)           │
-└──────────────────────────────────────┘
-```
+- **Multiple tables**: System supports up to 32 separate allocations
+- **Globally tracked**: `ctx->page_tables[0..31]`
 
-**Message Types:**
-- `PAGE_REQUEST`: Request page from owner
-- `PAGE_REPLY`: Send page data
-- `INVALIDATE`: Invalidate page copy
-- `INVALIDATE_ACK`: Acknowledge invalidation
-- `LOCK_REQUEST/GRANT/RELEASE`: Lock protocol
-- `BARRIER_ARRIVE/RELEASE`: Barrier protocol
+**Page Entry (`page_entry_t`):**
 
-### 4. Consistency Protocol (`src/consistency/`)
+- `page_id`: Globally unique identifier
+- `local_addr`: Virtual address on this node
+- `owner`: Node ID of current owner
+- `state`: `INVALID` / `READ_ONLY` / `READ_WRITE`
+- `version`: Version counter for consistency
+- `request_pending`: Flag to prevent duplicate fetches (request queuing)
+- `entry_lock`: Per-page mutex for fine-grained locking
+- `ready_cv`: Condition variable for waiting threads
+- `num_waiting_threads`: Queue depth tracking
 
-**Responsibilities:**
-- Implement Single-Writer/Multiple-Reader protocol
-- Track page ownership globally
-- Handle invalidations on write access
-- Queue concurrent requests
+**Key Operations:**
 
-**Protocol State Machine:**
-```
-Page States (per node):
-┌─────────────────────────────────────────┐
-│  INVALID  →  READ_ONLY  →  READ_WRITE   │
-│     ↑            ↑             │         │
-│     └────────────┴─────────────┘         │
-│         (invalidation)                   │
-└─────────────────────────────────────────┘
+- `page_table_lookup_by_addr()`: Find page entry from virtual address
+- `page_table_lookup_by_id()`: Find page entry from global page ID
+- `page_table_set_state()`: Update page state
+- `page_table_acquire/release()`: Reference counting for safe concurrent access
 
-Transitions:
-1. INVALID → READ_ONLY: Read fault, fetch page
-2. INVALID → READ_WRITE: Write fault, fetch + invalidate others
-3. READ_ONLY → READ_WRITE: Write fault, acquire exclusive
-4. * → INVALID: Receive invalidation message
-```
+## Page Fault Handling
 
-**Write Protocol:**
-```
-Node A wants to write page P (owned by Node B)
-    ↓
-1. Send PAGE_REQUEST(P, WRITE) to directory/owner
-    ↓
-2. Directory sends INVALIDATE to all sharers
-    ↓
-3. Sharers set page to INVALID, send ACK
-    ↓
-4. Owner sends PAGE_REPLY with data to Node A
-    ↓
-5. Node A sets permission to READ_WRITE
-    ↓
-6. Directory updates owner to Node A
-```
+### Signal Handler Installation
 
-### 5. Synchronization Primitives (`src/sync/`)
+**Initialization:**
 
-**Responsibilities:**
-- Distributed locks for mutual exclusion
-- Barriers for synchronization points
-
-**Lock Protocol (Centralized Manager):**
-```
-Lock Manager (on manager node):
-┌─────────────────────┐
-│ Lock ID → State     │
-│   State: FREE/HELD  │
-│   Holder: node_id   │
-│   Waiters: queue    │
-└─────────────────────┘
-
-Acquire Flow:
-Node → LOCK_REQUEST → Manager
-         ↓
-    Lock available?
-         │
-    ┌────┴────┐
-   YES        NO
-    │          │
-    ▼          ▼
-Grant lock   Queue request
-    │          │
-    ▼          ▼
-Manager → LOCK_GRANT → Node
-```
-
-**Barrier Protocol:**
-```
-Barrier Manager:
-┌─────────────────────────┐
-│ Barrier ID → Count      │
-│   Expected: N           │
-│   Arrived: counter      │
-│   Waiters: list         │
-└─────────────────────────┘
-
-Flow:
-Each node → BARRIER_ARRIVE → Manager
-                ↓
-         Count++, reached N?
-                │
-           ┌────┴────┐
-          YES        NO
-           │          │
-           ▼          ▼
-    Broadcast      Wait for more
-   BARRIER_RELEASE
-```
-
-## Page Fault Handling Details
-
-### User-Space Fault Trapping
-
-**Why SIGSEGV?**
-- Only user-space mechanism to intercept page faults
-- Kernel sends `SIGSEGV` on invalid memory access
-- Signal handler can determine fault type and address
-
-**Implementation:**
 ```c
 struct sigaction sa;
 sa.sa_flags = SA_SIGINFO;
 sa.sa_sigaction = dsm_fault_handler;
-sigemptyset(&sa.sa_mask);
-sigaction(SIGSEGV, &sa, NULL);
+sigaction(SIGSEGV, &sa, &old_sa);
 ```
 
-**Fault Handler Pseudocode:**
-```c
-void dsm_fault_handler(int sig, siginfo_t *info, void *context) {
-    void *fault_addr = info->si_addr;
+**C Functions Used:**
 
-    page_entry_t *page = page_table_lookup(fault_addr);
-    if (!page) {
-        // Not a DSM page, real segfault
-        abort();
-    }
+- `sigaction()`: Install custom SIGSEGV handler
+- `signal()`: Restore default handler on unrecognized faults
 
-    access_type_t access = determine_access_type(context);
+### Fault Detection and Handling
 
-    if (access == ACCESS_READ) {
-        handle_read_fault(page);
-    } else {
-        handle_write_fault(page);
-    }
-}
-```
+**Flow:**
 
-## Network Communication Details
+1. Hardware generates page fault → kernel delivers `SIGSEGV`
+2. Signal handler `dsm_fault_handler()` invoked
+3. Extract fault address from `siginfo_t->si_addr`
+4. Determine read vs. write fault from `ucontext_t->uc_mcontext.gregs[REG_ERR]`
+   - Bit 1 (0x2) set → write fault
+   - Otherwise → read fault
+5. Search all page tables for matching page entry
+6. If not in DSM region → re-raise SIGSEGV with default handler
+7. Dispatch to `handle_read_fault()` or `handle_write_fault()`
+
+### Read Fault Handler
+
+**State Transition:** `INVALID` → `READ_ONLY`
+
+1. Query directory for current owner
+2. Check request queuing:
+   - If another thread already fetching → wait on `entry->ready_cv`
+   - Otherwise mark `request_pending = true`
+3. Send `PAGE_REQUEST(READ)` to owner
+4. Wait for `PAGE_REPLY` with page data
+5. Copy data to local page
+6. Update permissions: `mprotect(addr, PAGE_SIZE, PROT_READ)`
+7. Update state to `READ_ONLY`
+8. Notify directory to add this node as reader
+9. Wake waiting threads via `pthread_cond_broadcast()`
+
+**C Functions Used:**
+
+- `mprotect(PROT_READ)`: Grant read-only access
+
+### Write Fault Handler
+
+**State Transitions:**
+
+- `INVALID` → `READ_WRITE`
+- `READ_ONLY` → `READ_WRITE`
+
+1. Query directory for owner
+2. Check request queuing
+3. Query owner for complete sharer list (handles nodes that fetched READ without directory update)
+4. Send `PAGE_REQUEST(WRITE)` to owner
+5. Owner sends `INVALIDATE` to all sharers
+6. Wait for `INVALIDATE_ACK` from all sharers
+7. Owner sends `PAGE_REPLY` with data
+8. Update local page with data
+9. Update permissions: `mprotect(addr, PAGE_SIZE, PROT_READ | PROT_WRITE)`
+10. Update state to `READ_WRITE`, set this node as owner
+11. Update directory ownership
+12. Wake waiting threads
+
+**C Functions Used:**
+
+- `mprotect(PROT_READ | PROT_WRITE)`: Grant read-write access
+
+## Consistency Protocol
+
+### Page Directory
+
+**Implementation:** Hash table with chaining (100K buckets)
+
+- Resides on manager node (Node 0)
+- Workers query via `DIR_QUERY` / `DIR_REPLY` messages
+
+**Directory Entry (`directory_entry_t`):**
+
+- `page_id`: Page identifier
+- `owner`: Node with write access
+- `sharers`: List of nodes with read-only copies (up to 16)
+- `lock`: Per-entry mutex
+
+**Operations:**
+
+- `directory_lookup()`: Get current owner
+- `directory_add_reader()`: Add node to sharer list
+- `directory_set_writer()`: Set new owner, return nodes to invalidate
+- `directory_clear_sharers()`: Remove all sharers after invalidation
+
+### Page Migration Protocol
+
+**Read Access:**
+
+1. Requester → Query directory → Get owner
+2. Requester → `PAGE_REQUEST(READ)` → Owner
+3. Owner → Add to local sharer tracking
+4. Owner → `PAGE_REPLY` with data → Requester
+5. Requester → Add as reader to directory
+6. Requester sets page to `READ_ONLY`
+
+**Write Access:**
+
+1. Requester → Query directory → Get owner + sharers
+2. Requester → `PAGE_REQUEST(WRITE)` → Owner
+3. Owner → `INVALIDATE` → All sharers (from local tracking + directory)
+4. Sharers → Set page to `INVALID` via `mprotect(PROT_NONE)`
+5. Sharers → `INVALIDATE_ACK` → Owner
+6. Owner waits for all ACKs (tracked via `pending_inv_acks`)
+7. Owner → `PAGE_REPLY` → Requester
+8. Requester → Update directory ownership
+9. Requester sets page to `READ_WRITE`
+
+**Sharer Tracking Fix:**
+The implementation uses dual tracking:
+
+- **Directory sharers**: Nodes that sent explicit read requests
+- **Owner's local tracking**: All nodes that got READ access (including those from write downgrades)
+- Before invalidation, requester queries owner for complete list via `SHARER_QUERY` / `SHARER_REPLY`
+
+### Invalidation
+
+On receiving `INVALIDATE`:
+
+1. Find page entry in local page table
+2. Set permission: `mprotect(addr, PAGE_SIZE, PROT_NONE)`
+3. Update state to `INVALID`
+4. Send `INVALIDATE_ACK` back
+
+**C Functions Used:**
+
+- `mprotect(PROT_NONE)`: Revoke all access
+
+## Network Layer
 
 ### Connection Management
 
-**Manager-Worker Architecture:**
-- One manager node coordinates the cluster
-- Workers connect to manager at startup
-- Peer-to-peer connections for page transfers
+**Manager:**
 
-**Connection Setup:**
-```
-Manager:
-    socket() → bind() → listen() → accept() [loop]
+- `socket()` + `bind()` + `listen()` on configured port
+- Separate accept thread handles incoming connections
+- Stores connections in `ctx->network.nodes[]` after `NODE_JOIN`
 
-Worker:
-    socket() → connect(manager)
+**Workers:**
 
-    For each peer:
-        socket() → connect(peer)
-```
+- `socket()` + `connect()` to manager
+- Send `NODE_JOIN` with node ID
 
-### Message Handling Thread
+**Dispatcher Thread:**
 
-**Dispatcher Pattern:**
+- Runs `poll()` on all connected sockets
+- Reads messages via `network_recv()` and dispatches to handlers
+- Separate thread prevents blocking
+
+**C Functions Used:**
+
+- `socket()`, `bind()`, `listen()`, `accept()`, `connect()`
+- `send()`, `recv()`: TCP byte stream transmission
+- `poll()`: Monitor multiple sockets for incoming data
+
+### Message Protocol
+
+**Message Structure:**
+
 ```c
-void* message_dispatcher(void *arg) {
-    while (running) {
-        // Wait for messages on all sockets
-        select()/poll() on all connections
-
-        // Read message header
-        recv(header)
-
-        // Read payload based on type
-        recv(payload)
-
-        // Dispatch to handler
-        switch (msg.type) {
-            case MSG_PAGE_REQUEST:
-                handle_page_request(&msg);
-                break;
-            case MSG_INVALIDATE:
-                handle_invalidate(&msg);
-                break;
-            // ...
-        }
-    }
-}
+typedef struct {
+    msg_header_t header;     // Magic, type, length, sender, seq_num
+    union {
+        page_request_payload_t;
+        page_reply_payload_t;   // Includes 4KB page data
+        invalidate_payload_t;
+        lock_request_payload_t;
+        barrier_arrive_payload_t;
+        // ... 15+ message types
+    } payload;
+} message_t;
 ```
 
-## Concurrency Considerations
+**Serialization:**
 
-### Thread Safety
+- Fixed-size headers
+- Variable-size payloads (largest is `PAGE_REPLY` with 4KB data)
+- Send header first, then payload
+- Magic number `0xDEADBEEF` for validation
 
-**Protected Resources:**
-- Page table: `pthread_mutex_t` per table
-- Message queue: `pthread_mutex_t` + `pthread_cond_t`
-- Lock manager: `pthread_mutex_t` per lock
-- Statistics: atomic operations or mutex
+**Key Message Types:**
 
-**Deadlock Prevention:**
-- Always acquire locks in same order (page_id ascending)
-- Timeout all blocking operations
-- No nested lock acquisitions
+- `PAGE_REQUEST` / `PAGE_REPLY`: Page migration
+- `INVALIDATE` / `INVALIDATE_ACK`: Coherence
+- `LOCK_REQUEST` / `LOCK_GRANT` / `LOCK_RELEASE`: Locks
+- `BARRIER_ARRIVE` / `BARRIER_RELEASE`: Barriers
+- `ALLOC_NOTIFY` / `ALLOC_ACK`: SVAS allocation
+- `DIR_QUERY` / `DIR_REPLY`: Directory lookup
+- `SHARER_QUERY` / `SHARER_REPLY`: Get complete sharer list
+- `HEARTBEAT`: Failure detection
+- `NODE_JOIN` / `NODE_FAILED`: Membership
+
+**Request/Response Tracking:**
+
+- Sequence numbers for debugging
+- Timeout-based handling (5-30 seconds depending on operation)
+- Retry logic with exponential backoff (up to 3 retries)
+
+## Synchronization Primitives
+
+### Distributed Locks
+
+**Architecture:** Centralized lock manager on Node 0
+
+**Acquisition Flow:**
+
+1. Node calls `dsm_lock_acquire(lock)`
+2. Send `LOCK_REQUEST(lock_id)` to manager
+3. Manager queues request in FIFO order
+4. When lock available, manager sends `LOCK_GRANT` to requester
+5. Requester wakes from `pthread_cond_wait()` and returns
+
+**Release Flow:**
+
+1. Node calls `dsm_lock_release(lock)`
+2. Send `LOCK_RELEASE(lock_id)` to manager
+3. Manager dequeues next waiter and sends `LOCK_GRANT` to them
+
+**Data Structures:**
+
+- `dsm_lock_t`: Client-side handle with condition variable
+- Manager maintains queue of waiting nodes per lock
+
+### Distributed Barriers
+
+**Architecture:** Centralized barrier manager on Node 0
+
+**Synchronization Flow:**
+
+1. Each node calls `dsm_barrier(barrier_id, num_participants)`
+2. Send `BARRIER_ARRIVE(barrier_id)` to manager
+3. Wait on local condition variable
+4. Manager counts arrivals
+5. When all participants arrived, manager broadcasts `BARRIER_RELEASE` to all
+6. Nodes wake from `pthread_cond_wait()` and continue
+
+**Data Structures:**
+
+- `dsm_barrier_t`: Arrival counter, participant list, condition variable
+- Manager tracks per-barrier state in `ctx->barrier_mgr.barriers[]`
+
+## Concurrency and Thread Safety
+
+### Locking Hierarchy
+
+**Global locks:**
+
+1. `ctx->lock`: Protects DSM context, node list, page table array
+2. `ctx->stats_lock`: Protects statistics counters
+3. `ctx->allocation_lock`: Serializes `dsm_malloc()` calls
+
+**Per-structure locks:**
+
+- `page_table->lock`: Protects page table operations
+- `entry->entry_lock`: Per-page fine-grained locking
+- `network.pending_lock`: Protects pending socket array
+- `directory->lock`: Protects directory hash table
+- `entry->lock`: Per-directory-entry lock
+
+**Ordering:** Always acquire global before per-structure locks
 
 ### Request Queuing
 
-**Why Queue?**
-- Multiple threads may fault on same page simultaneously
-- Avoid redundant page transfers
+**Problem:** Multiple threads faulting on same page → duplicate network requests
 
-**Implementation:**
-```c
-page_entry_t {
-    bool request_pending;
-    pthread_cond_t ready_cv;
-}
+**Solution:** First thread to fault sets `entry->request_pending = true`
 
-Thread 1: Page fault → Set pending → Send request → Wait on CV
-Thread 2: Page fault → See pending → Wait on CV
-...
-Handler: Receive reply → Signal CV → Wake all waiters
-```
-
-## Performance Considerations
-
-### Critical Path Optimization
-
-**Page Fault Latency:**
-```
-Fault → Signal handler → Table lookup → Network request →
-   Wait for reply → Update permission → Return
-
-Target: < 10ms for local network
-```
-
-**Optimizations:**
-- Fast page table lookup (hash table for large systems)
-- Batched invalidations
-- Prefetch adjacent pages
-- Caching of page locations
-
-### False Sharing
-
-**Problem:**
-```
-Node A writes array[0]
-Node B writes array[1]
-Both on same page → ping-pong effect
-```
-
-**Mitigation:**
-- Align data structures to page boundaries
-- Use padding between thread-local data
-- Application-level partitioning
+- Subsequent threads increment `num_waiting_threads` and wait on `entry->ready_cv`
+- First thread performs fetch, stores result in `entry->fetch_result`
+- On completion, broadcasts to wake all waiters
+- Waiters check result and either succeed or retry
 
 ## Failure Handling
 
-**Current Implementation:**
-- Timeouts on all network operations
-- Retry failed sends (up to N attempts)
-- Abort on unrecoverable errors
+### Heartbeat Mechanism
 
-**Future Enhancements:**
-- Node failure detection (heartbeats)
-- Page migration on failure
-- Checkpoint/recovery
+- Separate thread sends periodic `HEARTBEAT` messages
+- Tracks `last_heartbeat_time` and `missed_heartbeats` per node
+- After threshold, mark node as failed via `is_failed` flag
 
-## Design Decisions Rationale
+### Directory Recovery
 
-### Single-Writer vs MSI
+**On node failure:**
 
-**Chosen: Single-Writer**
-- Simpler to implement correctly
-- Easier to reason about consistency
-- Fewer message types
-- Sufficient for demo purposes
+- `directory_handle_node_failure()`: Remove from all sharer lists, mark owned pages as orphaned
+- `directory_reclaim_ownership()`: Requester can claim ownership on timeout
 
-**Trade-off:**
-- Less concurrent write performance
-- More invalidations than MSI
+**Timeout handling:**
 
-### Centralized vs Distributed Directory
+- Page requests timeout after 5-30 seconds
+- Retry up to 3 times with exponential backoff
+- Update stats: `ctx->stats.timeouts++`, `ctx->stats.network_failures++`
 
-**Chosen: Centralized (Manager Node)**
-- Simple implementation
-- Single point of coordination
-- Easier debugging
+## Performance Features
 
-**Trade-off:**
-- Manager is bottleneck
-- Single point of failure
+### Request Queuing (Task 8.1)
 
-### TCP vs UDP
+Prevents thundering herd on same page
 
-**Chosen: TCP**
-- Reliability built-in
-- Ordered delivery
-- Error detection
+### Performance Logging (Task 8.6)
 
-**Trade-off:**
-- Higher latency than UDP
-- More overhead
+- `ctx->stats`: Counters for faults, transfers, invalidations
+- Latency tracking: `total_fault_latency_ns`, `max_fault_latency_ns`
+- CSV export via `dsm_perf_export_stats()`
 
-## Code Organization
+### Statistics
 
-```
-src/
-├── core/
-│   ├── dsm.c           - Main initialization, API entry points
-│   ├── log.c           - Logging infrastructure
-│   └── stats.c         - Statistics tracking
-├── memory/
-│   ├── allocator.c     - dsm_malloc/free implementation
-│   ├── page_table.c    - Page table management
-│   └── fault_handler.c - SIGSEGV handler
-├── network/
-│   ├── server.c        - TCP server
-│   ├── client.c        - TCP client
-│   ├── protocol.c      - Serialization/deserialization
-│   └── messenger.c     - Message queue, dispatcher
-├── consistency/
-│   ├── coherence.c     - Consistency protocol
-│   ├── directory.c     - Page ownership directory
-│   └── invalidation.c  - Invalidation logic
-└── sync/
-    ├── lock.c          - Distributed locks
-    └── barrier.c       - Barriers
+```c
+typedef struct {
+    uint64_t page_faults;           // Total
+    uint64_t read_faults;           // Read-only
+    uint64_t write_faults;          // Exclusive
+    uint64_t pages_fetched;         // Received
+    uint64_t pages_sent;            // Sent
+    uint64_t invalidations_sent;
+    uint64_t network_bytes_sent;
+    uint64_t lock_acquires;
+    uint64_t barrier_waits;
+    // ... performance metrics
+} dsm_stats_t;
 ```
 
-## Testing Strategy
+## Critical System Functions Summary
 
-### Unit Tests
-- Page table operations
-- Message serialization/deserialization
-- Request queuing
-- State transitions
+### Memory Management
 
-### Integration Tests
-- Two-node ping-pong
-- Multi-node read sharing
-- Concurrent writes
-- Lock/barrier correctness
+- `mmap(PROT_NONE)`: Allocate pages with no initial access
+- `munmap()`: Free pages
+- `mprotect(PROT_NONE/READ/READ|WRITE)`: Change page permissions
 
-### Stress Tests
-- High fault rate
-- Random access patterns
-- Large memory regions
-- Many nodes
+### Signal Handling
 
----
+- `sigaction(SIGSEGV)`: Install page fault handler
+- `siginfo_t->si_addr`: Extract fault address
+- `ucontext_t->uc_mcontext.gregs[REG_ERR]`: Determine read vs. write fault
 
-*This document will be updated as implementation progresses.*
+### Network I/O
+
+- `socket()`: Create TCP socket
+- `bind()`, `listen()`, `accept()`: Server setup
+- `connect()`: Client connection
+- `send()`, `recv()`: Message transmission
+- `poll()`: Multiplex socket I/O
+
+### Thread Synchronization
+
+- `pthread_mutex_lock/unlock()`: Mutual exclusion
+- `pthread_cond_wait/signal/broadcast()`: Condition variables for page arrival, lock grants, barrier release
+- `pthread_create()`: Dispatcher and heartbeat threads
+
+### Time/Retry
+
+- `clock_gettime(CLOCK_REALTIME)`: Timeout calculations
+- `pthread_cond_timedwait()`: Bounded waiting
+- `usleep()`: Exponential backoff between retries
+
+## Data Flow Example: Write Fault
+
+```
+Thread accesses page → SIGSEGV → Handler extracts address
+                                       ↓
+                        Lookup page entry in page_tables[]
+                                       ↓
+                        Read REG_ERR → Detect write fault
+                                       ↓
+                        handle_write_fault(addr)
+                                       ↓
+                DIR_QUERY → Manager → DIR_REPLY (owner=Node X)
+                                       ↓
+                SHARER_QUERY → Node X → SHARER_REPLY (nodes Y,Z)
+                                       ↓
+                PAGE_REQUEST(WRITE) → Node X
+                                       ↓
+                Node X → INVALIDATE → Nodes Y,Z
+                                       ↓
+                Nodes Y,Z → mprotect(PROT_NONE) + INVALIDATE_ACK
+                                       ↓
+                Node X waits for all ACKs (pending_inv_acks)
+                                       ↓
+                Node X → PAGE_REPLY (4KB data) → Requester
+                                       ↓
+                Requester: memcpy to local_addr
+                          mprotect(PROT_READ|PROT_WRITE)
+                          Update state to READ_WRITE
+                          directory_set_owner()
+                                       ↓
+                Wake waiting threads → Return to application
+```
+
+## Key Design Choices
+
+| Aspect             | Choice                        | Rationale                                                         |
+| ------------------ | ----------------------------- | ----------------------------------------------------------------- |
+| Page size          | 4KB                           | Standard OS page size, hardware support for faults                |
+| Consistency        | Single-Writer/Multiple-Reader | Simplest invalidation protocol, avoids write conflicts            |
+| Directory          | Centralized on Node 0         | Simpler than distributed directory, acceptable for small clusters |
+| Locks/Barriers     | Centralized on Node 0         | Easier implementation, single point of coordination               |
+| Network            | TCP                           | Reliability over raw performance                                  |
+| Virtual addresses  | SVAS (same on all nodes)      | Simplifies pointer sharing, required for true DSM                 |
+| Fault detection    | `SIGSEGV` signal handler      | Only user-space mechanism available                               |
+| Permission control | `mprotect()`                  | OS-provided page protection, triggers hardware faults             |
+| Request queuing    | Per-page with CV              | Prevents duplicate requests, wakes all waiters                    |
+
+## Limitations
+
+- **Scalability**: Centralized directory and lock manager limit cluster size
+- **Single-writer**: No write-write sharing (MSI/MESI would be more sophisticated)
+- **Failure**: Limited tolerance—node failures detected but recovery is basic
+- **Performance**: Network latency dominates (no prefetching or adaptive policies)
+- **Max allocations**: 32 per node
+- **Max sharers**: 16 per page
