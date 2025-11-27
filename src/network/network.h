@@ -50,4 +50,16 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len);
  */
 int deserialize_message(const uint8_t *buffer, size_t len, message_t *msg);
 
+/**
+ * Prepare backup server without listening (for Node 1)
+ * Binds socket to port but doesn't start listening yet
+ */
+int network_prepare_backup_server(uint16_t port);
+
+/**
+ * Activate backup server (start listening)
+ * Called when backup node promotes to manager
+ */
+int network_activate_backup_server(void);
+
 #endif /* NETWORK_H */

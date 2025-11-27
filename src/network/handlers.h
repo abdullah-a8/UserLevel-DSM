@@ -68,6 +68,23 @@ int handle_node_failed_msg(const message_t *msg);
 void start_heartbeat_thread(void);
 void stop_heartbeat_thread(void);
 
+/* Hot backup failover - replication functions */
+int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters);
+int send_state_sync_barrier(barrier_id_t barrier_id, int num_arrived, int num_expected, uint64_t generation);
+int send_manager_promotion(node_id_t new_manager_id, node_id_t old_manager_id);
+int send_reconnect_request(node_id_t new_manager);
+
+/* Hot backup failover - handler functions */
+int handle_state_sync_dir(const message_t *msg);
+int handle_state_sync_lock(const message_t *msg);
+int handle_state_sync_barrier(const message_t *msg);
+int handle_manager_promotion(const message_t *msg);
+int handle_reconnect_request(const message_t *msg);
+
+/* Hot backup failover - promotion function */
+int promote_to_manager(void);
+
 /* Dispatch incoming message */
 int dispatch_message(const message_t *msg, int sockfd);
 

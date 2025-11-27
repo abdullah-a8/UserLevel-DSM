@@ -12,6 +12,7 @@
 #include "../consistency/directory.h"
 #include "../consistency/page_migration.h"
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1276,9 +1277,22 @@ static void* heartbeat_thread_func(void *arg) {
                             /* Release lock during directory operation to avoid deadlock */
                             pthread_mutex_unlock(&ctx->lock);
                             directory_handle_node_failure(dir, failed_node_id);
-                            
+
                             /* Broadcast failure to others */
                             broadcast_node_failure(failed_node_id);
+
+                            /* HOT BACKUP FAILOVER: Check if manager (Node 0) has failed */
+                            if (failed_node_id == 0 && ctx->network.backup_state.is_primary_backup) {
+                                LOG_WARN("Manager (Node 0) has FAILED! Initiating promotion...");
+
+                                /* Promote this node (Node 1) to manager */
+                                int promotion_rc = promote_to_manager();
+                                if (promotion_rc == DSM_SUCCESS) {
+                                    LOG_INFO("Successfully promoted to manager");
+                                } else {
+                                    LOG_ERROR("Promotion failed with error code %d", promotion_rc);
+                                }
+                            }
 
                             pthread_mutex_lock(&ctx->lock);
                             /* Note: Need to recheck loop condition after reacquiring lock */
@@ -1602,6 +1616,17 @@ int dispatch_message(const message_t *msg, int sockfd) {
         case MSG_NODE_LEAVE:
             LOG_INFO("Received NODE_LEAVE from node %u", msg->header.sender);
             return DSM_SUCCESS;
+        /* Hot backup failover messages */
+        case MSG_STATE_SYNC_DIR:
+            return handle_state_sync_dir(msg);
+        case MSG_STATE_SYNC_LOCK:
+            return handle_state_sync_lock(msg);
+        case MSG_STATE_SYNC_BARRIER:
+            return handle_state_sync_barrier(msg);
+        case MSG_MANAGER_PROMOTION:
+            return handle_manager_promotion(msg);
+        case MSG_RECONNECT_REQUEST:
+            return handle_reconnect_request(msg);
         case MSG_ERROR:
             {
                 int error_code = msg->payload.error.error_code;
@@ -1641,4 +1666,649 @@ int dispatch_message(const message_t *msg, int sockfd) {
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;
     }
+}
+
+/* ============================================================================
+ * HOT BACKUP FAILOVER - REPLICATION FUNCTIONS
+ * ============================================================================ */
+
+/**
+ * Get next sync sequence number
+ */
+static uint64_t get_next_sync_seq(void) {
+    dsm_context_t *ctx = dsm_get_context();
+    pthread_mutex_lock(&ctx->network.seq_lock);
+    uint64_t seq = ctx->network.next_seq_num++;
+    pthread_mutex_unlock(&ctx->network.seq_lock);
+    return seq;
+}
+
+/**
+ * Send directory state sync to primary backup (Node 1)
+ */
+int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only manager replicates, and only if not promoted backup */
+    if (!ctx->config.is_manager || ctx->network.backup_state.is_promoted) {
+        return DSM_SUCCESS;  /* Silently skip */
+    }
+
+    /* Check if primary backup (Node 1) is connected */
+    if (ctx->network.num_nodes < 1 || !ctx->network.nodes[1].connected) {
+        return DSM_SUCCESS;  /* No backup available */
+    }
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_STATE_SYNC_DIR;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.state_sync_dir.sync_seq = get_next_sync_seq();
+    msg.payload.state_sync_dir.page_id = page_id;
+    msg.payload.state_sync_dir.owner = owner;
+    msg.payload.state_sync_dir.num_sharers = num_sharers < MAX_SHARERS ? num_sharers : MAX_SHARERS;
+
+    for (int i = 0; i < msg.payload.state_sync_dir.num_sharers; i++) {
+        msg.payload.state_sync_dir.sharers[i] = sharers[i];
+    }
+
+    /* Async send to Node 1 (primary backup) */
+    return network_send(1, &msg);
+}
+
+/**
+ * Send lock state sync to primary backup (Node 1)
+ */
+int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only manager replicates, and only if not promoted backup */
+    if (!ctx->config.is_manager || ctx->network.backup_state.is_promoted) {
+        return DSM_SUCCESS;
+    }
+
+    /* Check if primary backup (Node 1) is connected */
+    if (ctx->network.num_nodes < 1 || !ctx->network.nodes[1].connected) {
+        return DSM_SUCCESS;
+    }
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_STATE_SYNC_LOCK;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.state_sync_lock.sync_seq = get_next_sync_seq();
+    msg.payload.state_sync_lock.lock_id = lock_id;
+    msg.payload.state_sync_lock.holder = holder;
+    msg.payload.state_sync_lock.num_waiters = num_waiters < 32 ? num_waiters : 32;
+
+    for (int i = 0; i < msg.payload.state_sync_lock.num_waiters; i++) {
+        msg.payload.state_sync_lock.waiters[i] = waiters[i];
+    }
+
+    return network_send(1, &msg);
+}
+
+/**
+ * Send barrier state sync to primary backup (Node 1)
+ */
+int send_state_sync_barrier(barrier_id_t barrier_id, int num_arrived, int num_expected, uint64_t generation) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only manager replicates, and only if not promoted backup */
+    if (!ctx->config.is_manager || ctx->network.backup_state.is_promoted) {
+        return DSM_SUCCESS;
+    }
+
+    /* Check if primary backup (Node 1) is connected */
+    if (ctx->network.num_nodes < 1 || !ctx->network.nodes[1].connected) {
+        return DSM_SUCCESS;
+    }
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_STATE_SYNC_BARRIER;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.state_sync_barrier.sync_seq = get_next_sync_seq();
+    msg.payload.state_sync_barrier.barrier_id = barrier_id;
+    msg.payload.state_sync_barrier.num_arrived = num_arrived;
+    msg.payload.state_sync_barrier.num_expected = num_expected;
+    msg.payload.state_sync_barrier.generation = generation;
+
+    return network_send(1, &msg);
+}
+
+/**
+ * Broadcast manager promotion to all nodes
+ */
+int send_manager_promotion(node_id_t new_manager_id, node_id_t old_manager_id) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_MANAGER_PROMOTION;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.manager_promotion.new_manager_id = new_manager_id;
+    msg.payload.manager_promotion.old_manager_id = old_manager_id;
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    msg.payload.manager_promotion.promotion_time = now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+    /* Broadcast to all connected nodes */
+    int broadcast_count = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (i != ctx->node_id && ctx->network.nodes[i].connected) {
+            network_send(i, &msg);
+            broadcast_count++;
+        }
+    }
+
+    LOG_INFO("Broadcasted MANAGER_PROMOTION to %d nodes (new_manager=%u, old_manager=%u)",
+             broadcast_count, new_manager_id, old_manager_id);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Send reconnection request to new manager after failover
+ * Workers call this after receiving MANAGER_PROMOTION
+ */
+int send_reconnect_request(node_id_t new_manager) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.header.magic = MSG_MAGIC;
+    msg.header.type = MSG_RECONNECT_REQUEST;
+    msg.header.sender = ctx->node_id;
+
+    msg.payload.reconnect_request.requester_id = ctx->node_id;
+    msg.payload.reconnect_request.last_seq_seen = ctx->network.next_seq_num;
+
+    /* Send to new manager */
+    int rc = network_send(new_manager, &msg);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to send RECONNECT_REQUEST to new manager (Node %u)", new_manager);
+        return rc;
+    }
+
+    LOG_INFO("Sent RECONNECT_REQUEST to new manager (Node %u)", new_manager);
+
+    return DSM_SUCCESS;
+}
+
+/* ============================================================================
+ * HOT BACKUP FAILOVER - HANDLER FUNCTIONS (STUBS - TO BE IMPLEMENTED IN PHASE 4)
+ * ============================================================================ */
+
+/**
+ * Handle directory state sync from manager
+ * Updates shadow directory on backup node
+ */
+int handle_state_sync_dir(const message_t *msg) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only backup nodes handle state sync */
+    if (!ctx->network.backup_state.is_backup) {
+        LOG_WARN("Received STATE_SYNC_DIR but not a backup node");
+        return DSM_SUCCESS;
+    }
+
+    page_id_t page_id = msg->payload.state_sync_dir.page_id;
+    node_id_t owner = msg->payload.state_sync_dir.owner;
+    int num_sharers = msg->payload.state_sync_dir.num_sharers;
+    uint64_t sync_seq = msg->payload.state_sync_dir.sync_seq;
+
+    /* Check sequence number for ordering */
+    if (sync_seq <= ctx->network.backup_state.last_sync_seq) {
+        LOG_DEBUG("Ignoring out-of-order STATE_SYNC_DIR: seq=%lu, last=%lu",
+                  sync_seq, ctx->network.backup_state.last_sync_seq);
+        return DSM_SUCCESS;
+    }
+    ctx->network.backup_state.last_sync_seq = sync_seq;
+
+    /* Ensure shadow directory exists */
+    if (!ctx->network.backup_state.backup_directory) {
+        /* Create shadow directory with same size as manager (100K buckets) */
+        extern page_directory_t* directory_create(size_t table_size);
+        ctx->network.backup_state.backup_directory = directory_create(100000);
+        if (!ctx->network.backup_state.backup_directory) {
+            LOG_ERROR("Failed to create shadow directory");
+            return DSM_ERROR_MEMORY;
+        }
+        LOG_INFO("Created shadow directory for backup replication");
+    }
+
+    page_directory_t *shadow_dir = (page_directory_t*)ctx->network.backup_state.backup_directory;
+
+    /* Update shadow directory entry */
+    extern int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owner);
+    extern int directory_clear_sharers(page_directory_t *dir, page_id_t page_id);
+    extern int directory_add_reader(page_directory_t *dir, page_id_t page_id, node_id_t reader);
+
+    /* Set owner */
+    int rc = directory_set_owner(shadow_dir, page_id, owner);
+    if (rc != DSM_SUCCESS) {
+        LOG_ERROR("Failed to set owner in shadow directory for page %lu", page_id);
+        return rc;
+    }
+
+    /* Clear existing sharers, then add new ones */
+    directory_clear_sharers(shadow_dir, page_id);
+    for (int i = 0; i < num_sharers && i < MAX_SHARERS; i++) {
+        node_id_t sharer = msg->payload.state_sync_dir.sharers[i];
+        directory_add_reader(shadow_dir, page_id, sharer);
+    }
+
+    LOG_DEBUG("Updated shadow directory: page=%lu, owner=%u, sharers=%d (seq=%lu)",
+              page_id, owner, num_sharers, sync_seq);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Handle lock state sync from manager
+ * Updates shadow lock on backup node
+ */
+int handle_state_sync_lock(const message_t *msg) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only backup nodes handle state sync */
+    if (!ctx->network.backup_state.is_backup) {
+        LOG_WARN("Received STATE_SYNC_LOCK but not a backup node");
+        return DSM_SUCCESS;
+    }
+
+    lock_id_t lock_id = msg->payload.state_sync_lock.lock_id;
+    node_id_t holder = msg->payload.state_sync_lock.holder;
+    int num_waiters = msg->payload.state_sync_lock.num_waiters;
+    uint64_t sync_seq = msg->payload.state_sync_lock.sync_seq;
+
+    /* Check sequence number */
+    if (sync_seq <= ctx->network.backup_state.last_sync_seq) {
+        LOG_DEBUG("Ignoring out-of-order STATE_SYNC_LOCK: seq=%lu, last=%lu",
+                  sync_seq, ctx->network.backup_state.last_sync_seq);
+        return DSM_SUCCESS;
+    }
+    ctx->network.backup_state.last_sync_seq = sync_seq;
+
+    /* Find or create shadow lock slot */
+    int slot = -1;
+    for (int i = 0; i < 256; i++) {
+        if (ctx->network.backup_state.backup_locks[i] == NULL) {
+            if (slot == -1) slot = i;  /* First empty slot */
+            continue;
+        }
+        /* Check if shadow lock already exists */
+        struct dsm_lock_s *shadow_lock = (struct dsm_lock_s*)ctx->network.backup_state.backup_locks[i];
+        if (shadow_lock->id == lock_id) {
+            slot = i;
+            break;
+        }
+    }
+
+    struct dsm_lock_s *shadow_lock;
+    if (slot == -1) {
+        LOG_ERROR("Shadow lock array full (max 256 locks)");
+        return DSM_ERROR_MEMORY;
+    }
+
+    if (ctx->network.backup_state.backup_locks[slot] == NULL) {
+        /* Create new shadow lock */
+        shadow_lock = (struct dsm_lock_s*)calloc(1, sizeof(struct dsm_lock_s));
+        if (!shadow_lock) {
+            LOG_ERROR("Failed to allocate shadow lock");
+            return DSM_ERROR_MEMORY;
+        }
+        shadow_lock->id = lock_id;
+        pthread_mutex_init(&shadow_lock->local_lock, NULL);
+        pthread_cond_init(&shadow_lock->acquired_cv, NULL);
+        ctx->network.backup_state.backup_locks[slot] = shadow_lock;
+        LOG_DEBUG("Created shadow lock %lu", lock_id);
+    } else {
+        shadow_lock = (struct dsm_lock_s*)ctx->network.backup_state.backup_locks[slot];
+    }
+
+    /* Update shadow lock state */
+    pthread_mutex_lock(&shadow_lock->local_lock);
+
+    /* Clear existing waiter queue */
+    lock_waiter_t *waiter = shadow_lock->waiters_head;
+    while (waiter) {
+        lock_waiter_t *next = waiter->next;
+        free(waiter);
+        waiter = next;
+    }
+    shadow_lock->waiters_head = NULL;
+    shadow_lock->waiters_tail = NULL;
+
+    /* Set holder and state */
+    shadow_lock->holder = holder;
+    if (holder == (node_id_t)-1) {
+        shadow_lock->state = LOCK_STATE_FREE;
+    } else {
+        shadow_lock->state = LOCK_STATE_HELD;
+    }
+
+    /* Rebuild waiter queue */
+    for (int i = 0; i < num_waiters && i < 32; i++) {
+        lock_waiter_t *new_waiter = (lock_waiter_t*)malloc(sizeof(lock_waiter_t));
+        if (!new_waiter) {
+            LOG_ERROR("Failed to allocate waiter in shadow lock");
+            pthread_mutex_unlock(&shadow_lock->local_lock);
+            return DSM_ERROR_MEMORY;
+        }
+        new_waiter->node_id = msg->payload.state_sync_lock.waiters[i];
+        new_waiter->next = NULL;
+
+        if (shadow_lock->waiters_tail) {
+            shadow_lock->waiters_tail->next = new_waiter;
+            shadow_lock->waiters_tail = new_waiter;
+        } else {
+            shadow_lock->waiters_head = shadow_lock->waiters_tail = new_waiter;
+        }
+    }
+
+    pthread_mutex_unlock(&shadow_lock->local_lock);
+
+    LOG_DEBUG("Updated shadow lock: id=%lu, holder=%u, waiters=%d (seq=%lu)",
+              lock_id, holder, num_waiters, sync_seq);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Handle barrier state sync from manager
+ * Updates shadow barrier on backup node
+ */
+int handle_state_sync_barrier(const message_t *msg) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Only backup nodes handle state sync */
+    if (!ctx->network.backup_state.is_backup) {
+        LOG_WARN("Received STATE_SYNC_BARRIER but not a backup node");
+        return DSM_SUCCESS;
+    }
+
+    barrier_id_t barrier_id = msg->payload.state_sync_barrier.barrier_id;
+    int num_arrived = msg->payload.state_sync_barrier.num_arrived;
+    int num_expected = msg->payload.state_sync_barrier.num_expected;
+    uint64_t generation = msg->payload.state_sync_barrier.generation;
+    uint64_t sync_seq = msg->payload.state_sync_barrier.sync_seq;
+
+    /* Check sequence number */
+    if (sync_seq <= ctx->network.backup_state.last_sync_seq) {
+        LOG_DEBUG("Ignoring out-of-order STATE_SYNC_BARRIER: seq=%lu, last=%lu",
+                  sync_seq, ctx->network.backup_state.last_sync_seq);
+        return DSM_SUCCESS;
+    }
+    ctx->network.backup_state.last_sync_seq = sync_seq;
+
+    /* Find or create shadow barrier slot */
+    int slot = -1;
+    for (int i = 0; i < 256; i++) {
+        if (ctx->network.backup_state.backup_barriers[i] == NULL) {
+            if (slot == -1) slot = i;  /* First empty slot */
+            continue;
+        }
+        /* Check if shadow barrier already exists */
+        dsm_barrier_t *shadow_barrier = (dsm_barrier_t*)ctx->network.backup_state.backup_barriers[i];
+        if (shadow_barrier->id == barrier_id) {
+            slot = i;
+            break;
+        }
+    }
+
+    dsm_barrier_t *shadow_barrier;
+    if (slot == -1) {
+        LOG_ERROR("Shadow barrier array full (max 256 barriers)");
+        return DSM_ERROR_MEMORY;
+    }
+
+    if (ctx->network.backup_state.backup_barriers[slot] == NULL) {
+        /* Create new shadow barrier */
+        shadow_barrier = (dsm_barrier_t*)calloc(1, sizeof(dsm_barrier_t));
+        if (!shadow_barrier) {
+            LOG_ERROR("Failed to allocate shadow barrier");
+            return DSM_ERROR_MEMORY;
+        }
+        shadow_barrier->id = barrier_id;
+        pthread_mutex_init(&shadow_barrier->lock, NULL);
+        pthread_cond_init(&shadow_barrier->all_arrived_cv, NULL);
+        ctx->network.backup_state.backup_barriers[slot] = shadow_barrier;
+        LOG_DEBUG("Created shadow barrier %lu", barrier_id);
+    } else {
+        shadow_barrier = (dsm_barrier_t*)ctx->network.backup_state.backup_barriers[slot];
+    }
+
+    /* Update shadow barrier state */
+    pthread_mutex_lock(&shadow_barrier->lock);
+    shadow_barrier->expected_count = num_expected;
+    shadow_barrier->arrived_count = num_arrived;
+    shadow_barrier->generation = generation;
+    pthread_mutex_unlock(&shadow_barrier->lock);
+
+    LOG_DEBUG("Updated shadow barrier: id=%lu, arrived=%d/%d, gen=%lu (seq=%lu)",
+              barrier_id, num_arrived, num_expected, generation, sync_seq);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Handle manager promotion notification
+ * Workers receive this when backup promotes to manager after Node 0 failure
+ */
+int handle_manager_promotion(const message_t *msg) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    node_id_t new_manager = msg->payload.manager_promotion.new_manager_id;
+    node_id_t old_manager = msg->payload.manager_promotion.old_manager_id;
+
+    LOG_INFO("Received MANAGER_PROMOTION: new_manager=%u, old_manager=%u",
+             new_manager, old_manager);
+
+    /* Only workers (non-managers, non-backups) need to reconnect */
+    if (ctx->config.is_manager || ctx->network.backup_state.is_backup) {
+        LOG_DEBUG("Skipping reconnection (this is manager or backup node)");
+        return DSM_SUCCESS;
+    }
+
+    /* Update current manager reference */
+    ctx->network.backup_state.current_manager = new_manager;
+
+    /* Mark old manager as failed if not already */
+    if (old_manager < MAX_NODES && !ctx->network.nodes[old_manager].is_failed) {
+        LOG_INFO("Marking old manager (Node %u) as failed", old_manager);
+        ctx->network.nodes[old_manager].is_failed = true;
+        ctx->network.nodes[old_manager].connected = false;
+    }
+
+    /*
+     * In star topology, workers send directory queries and page requests to manager.
+     * The network layer already handles retries and will automatically use the
+     * new manager node since we updated current_manager above.
+     *
+     * We don't need to close/reopen connections because in the star topology,
+     * workers are connected to the manager at Node 0's socket, and the promoted
+     * backup (Node 1) will be accepting connections on its own socket.
+     *
+     * The key insight: workers don't maintain persistent connections to the manager.
+     * Instead, they send messages through the network layer which looks up the
+     * connection to the manager node dynamically.
+     */
+
+    /* Send reconnection request to new manager */
+    int rc = send_reconnect_request(new_manager);
+    if (rc != DSM_SUCCESS) {
+        LOG_WARN("Failed to send reconnection request to new manager (rc=%d)", rc);
+        /* Continue anyway - not fatal, as future operations will implicitly reconnect */
+    }
+
+    LOG_INFO("Successfully updated to new manager (Node %u)", new_manager);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Handle reconnection request from worker after failover
+ * New manager (promoted backup) receives this and acknowledges the worker
+ */
+int handle_reconnect_request(const message_t *msg) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    node_id_t requester = msg->payload.reconnect_request.requester_id;
+    uint64_t last_seq = msg->payload.reconnect_request.last_seq_seen;
+
+    LOG_INFO("Received RECONNECT_REQUEST from Node %u (last_seq=%lu)",
+             requester, last_seq);
+
+    /* Only promoted managers should handle this */
+    if (!ctx->network.backup_state.is_promoted) {
+        LOG_WARN("Received reconnect request but not promoted - ignoring");
+        return DSM_SUCCESS;
+    }
+
+    /*
+     * In star topology, the worker is already connected to us via the network.
+     * We just need to acknowledge that we're ready to serve as manager.
+     *
+     * The worker will start sending directory queries and page requests to us
+     * as the new manager automatically.
+     *
+     * We could send a confirmation message, but it's not strictly necessary
+     * because the worker will discover we're alive through normal protocol
+     * messages (directory queries, page requests, etc.)
+     */
+
+    LOG_INFO("Worker Node %u reconnection acknowledged", requester);
+
+    return DSM_SUCCESS;
+}
+
+/**
+ * Promote backup node to manager
+ * Called when Node 0 (manager) fails and this is Node 1 (primary backup)
+ */
+int promote_to_manager(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    /* Acquire promotion lock to prevent split-brain */
+    pthread_mutex_lock(&ctx->network.backup_state.promotion_lock);
+
+    /* Double-check we're not already promoted */
+    if (ctx->network.backup_state.is_promoted) {
+        LOG_WARN("Already promoted to manager, skipping");
+        pthread_mutex_unlock(&ctx->network.backup_state.promotion_lock);
+        return DSM_SUCCESS;
+    }
+
+    LOG_INFO("=== PROMOTING NODE %u TO MANAGER ===", ctx->node_id);
+
+    /* Step 1: Mark as promoted */
+    ctx->network.backup_state.is_promoted = true;
+    ctx->config.is_manager = true;  /* Update config to reflect new role */
+
+    /* Step 2: Activate shadow directory as primary */
+    if (ctx->network.backup_state.backup_directory) {
+        /* Get current page directory from consistency layer */
+        extern page_directory_t* get_page_directory(void);
+        extern void set_page_directory(page_directory_t *dir);
+
+        /* Replace current directory with shadow directory */
+        page_directory_t *old_dir = get_page_directory();
+        set_page_directory((page_directory_t*)ctx->network.backup_state.backup_directory);
+
+        /* Clear the backup pointer (now it's the primary) */
+        ctx->network.backup_state.backup_directory = NULL;
+
+        LOG_INFO("Activated shadow directory as primary (replaced old directory)");
+
+        /* Note: We don't destroy old_dir as it might still be in use */
+    } else {
+        LOG_WARN("No shadow directory to activate - starting with empty directory");
+    }
+
+    /* Step 3: Activate shadow locks as primary */
+    pthread_mutex_lock(&ctx->lock_mgr.lock);
+    for (int i = 0; i < 256; i++) {
+        if (ctx->network.backup_state.backup_locks[i] != NULL) {
+            /* Find empty slot in primary lock manager or replace existing */
+            bool placed = false;
+            for (int j = 0; j < 256; j++) {
+                if (ctx->lock_mgr.locks[j] == NULL ||
+                    ctx->lock_mgr.locks[j]->id == ((struct dsm_lock_s*)ctx->network.backup_state.backup_locks[i])->id) {
+                    ctx->lock_mgr.locks[j] = (struct dsm_lock_s*)ctx->network.backup_state.backup_locks[i];
+                    ctx->network.backup_state.backup_locks[i] = NULL;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                LOG_WARN("Could not place shadow lock into primary lock manager (full)");
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock_mgr.lock);
+    LOG_INFO("Activated shadow locks as primary");
+
+    /* Step 4: Activate shadow barriers as primary */
+    pthread_mutex_lock(&ctx->barrier_mgr.lock);
+    for (int i = 0; i < 256 && i < ctx->barrier_mgr.max_barriers; i++) {
+        if (ctx->network.backup_state.backup_barriers[i] != NULL) {
+            /* Copy shadow barrier to primary barrier manager */
+            dsm_barrier_t *shadow = (dsm_barrier_t*)ctx->network.backup_state.backup_barriers[i];
+
+            /* Find the barrier in primary manager by ID */
+            bool found = false;
+            for (int j = 0; j < ctx->barrier_mgr.max_barriers; j++) {
+                if (ctx->barrier_mgr.barriers[j].id == shadow->id &&
+                    ctx->barrier_mgr.barriers[j].expected_count > 0) {
+                    /* Update existing barrier */
+                    ctx->barrier_mgr.barriers[j].arrived_count = shadow->arrived_count;
+                    ctx->barrier_mgr.barriers[j].generation = shadow->generation;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                /* Find empty slot */
+                for (int j = 0; j < ctx->barrier_mgr.max_barriers; j++) {
+                    if (ctx->barrier_mgr.barriers[j].expected_count == 0) {
+                        ctx->barrier_mgr.barriers[j] = *shadow;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            /* Free shadow barrier */
+            pthread_mutex_destroy(&shadow->lock);
+            pthread_cond_destroy(&shadow->all_arrived_cv);
+            free(shadow);
+            ctx->network.backup_state.backup_barriers[i] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&ctx->barrier_mgr.lock);
+    LOG_INFO("Activated shadow barriers as primary");
+
+    /* Step 5: Update current_manager to self */
+    ctx->network.backup_state.current_manager = ctx->node_id;
+
+    /* Step 6: Broadcast promotion to all nodes */
+    send_manager_promotion(ctx->node_id, 0);  /* new_manager=self, old_manager=0 */
+
+    pthread_mutex_unlock(&ctx->network.backup_state.promotion_lock);
+
+    LOG_INFO("=== PROMOTION COMPLETE - NOW ACTING AS MANAGER ===");
+
+    return DSM_SUCCESS;
 }

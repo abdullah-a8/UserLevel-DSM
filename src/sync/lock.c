@@ -323,7 +323,17 @@ int lock_manager_grant(lock_id_t lock_id, node_id_t requester) {
         /* Lock is free, grant immediately */
         lock->state = LOCK_STATE_HELD;
         lock->holder = requester;
+
+        /* Capture state for replication */
+        node_id_t holder_copy = lock->holder;
+
         pthread_mutex_unlock(&lock->local_lock);
+
+        /* Replicate lock state to backup */
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters);
+            send_state_sync_lock(lock_id, holder_copy, NULL, 0);
+        }
 
         LOG_DEBUG("Manager granted lock %lu to node %u", lock_id, requester);
         return send_lock_grant(requester, lock_id);
@@ -345,7 +355,24 @@ int lock_manager_grant(lock_id_t lock_id, node_id_t requester) {
             lock->waiters_head = lock->waiters_tail = waiter;
         }
 
+        /* Capture waiter queue for replication */
+        node_id_t holder_copy = lock->holder;
+        node_id_t waiters_copy[32];
+        int num_waiters = 0;
+        lock_waiter_t *w = lock->waiters_head;
+        while (w && num_waiters < 32) {
+            waiters_copy[num_waiters++] = w->node_id;
+            w = w->next;
+        }
+
         pthread_mutex_unlock(&lock->local_lock);
+
+        /* Replicate lock state to backup */
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters);
+            send_state_sync_lock(lock_id, holder_copy, waiters_copy, num_waiters);
+        }
+
         LOG_DEBUG("Manager queued node %u for lock %lu", requester, lock_id);
         return DSM_SUCCESS;
     }
@@ -384,7 +411,25 @@ int lock_manager_release(lock_id_t lock_id, node_id_t releaser) {
         free(next_waiter);
 
         lock->holder = next_holder;
+
+        /* Capture remaining waiters for replication */
+        node_id_t holder_copy = lock->holder;
+        node_id_t waiters_copy[32];
+        int num_waiters = 0;
+        lock_waiter_t *w = lock->waiters_head;
+        while (w && num_waiters < 32) {
+            waiters_copy[num_waiters++] = w->node_id;
+            w = w->next;
+        }
+
         pthread_mutex_unlock(&lock->local_lock);
+
+        /* Replicate lock state to backup */
+        dsm_context_t *ctx = dsm_get_context();
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters);
+            send_state_sync_lock(lock_id, holder_copy, waiters_copy, num_waiters);
+        }
 
         LOG_DEBUG("Manager granted lock %lu to next waiter (node %u)", lock_id, next_holder);
         return send_lock_grant(next_holder, lock_id);
@@ -392,7 +437,15 @@ int lock_manager_release(lock_id_t lock_id, node_id_t releaser) {
         /* No waiters, mark as free */
         lock->state = LOCK_STATE_FREE;
         lock->holder = (node_id_t)-1;
+
         pthread_mutex_unlock(&lock->local_lock);
+
+        /* Replicate lock state to backup */
+        dsm_context_t *ctx = dsm_get_context();
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *waiters, int num_waiters);
+            send_state_sync_lock(lock_id, (node_id_t)-1, NULL, 0);
+        }
 
         LOG_DEBUG("Manager released lock %lu (no waiters)", lock_id);
         return DSM_SUCCESS;

@@ -39,6 +39,17 @@ int network_server_init(uint16_t port) {
         return DSM_ERROR_NETWORK;
     }
 
+    /* Set SO_REUSEPORT to allow backup to also bind to this port */
+#ifdef SO_REUSEPORT
+    opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        LOG_WARN("setsockopt SO_REUSEPORT failed: %s (hot backup may not work)", strerror(errno));
+        /* Not fatal - continue without SO_REUSEPORT */
+    } else {
+        LOG_DEBUG("SO_REUSEPORT enabled for manager server socket");
+    }
+#endif
+
     /* Bind */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -276,6 +287,30 @@ int serialize_message(const message_t *msg, uint8_t *buffer, size_t *len) {
             memcpy(buffer + offset, &msg->payload.sharer_reply, sizeof(sharer_reply_payload_t));
             offset += sizeof(sharer_reply_payload_t);
             break;
+        case MSG_STATE_SYNC_DIR:
+            memcpy(buffer + offset, &msg->payload.state_sync_dir, sizeof(state_sync_dir_payload_t));
+            offset += sizeof(state_sync_dir_payload_t);
+            break;
+        case MSG_STATE_SYNC_LOCK:
+            memcpy(buffer + offset, &msg->payload.state_sync_lock, sizeof(state_sync_lock_payload_t));
+            offset += sizeof(state_sync_lock_payload_t);
+            break;
+        case MSG_STATE_SYNC_BARRIER:
+            memcpy(buffer + offset, &msg->payload.state_sync_barrier, sizeof(state_sync_barrier_payload_t));
+            offset += sizeof(state_sync_barrier_payload_t);
+            break;
+        case MSG_STATE_SYNC_NODE:
+            memcpy(buffer + offset, &msg->payload.state_sync_node, sizeof(state_sync_node_payload_t));
+            offset += sizeof(state_sync_node_payload_t);
+            break;
+        case MSG_MANAGER_PROMOTION:
+            memcpy(buffer + offset, &msg->payload.manager_promotion, sizeof(manager_promotion_payload_t));
+            offset += sizeof(manager_promotion_payload_t);
+            break;
+        case MSG_RECONNECT_REQUEST:
+            memcpy(buffer + offset, &msg->payload.reconnect_request, sizeof(reconnect_request_payload_t));
+            offset += sizeof(reconnect_request_payload_t);
+            break;
         default:
             LOG_WARN("Unknown message type: %d", msg->header.type);
             return DSM_ERROR_INVALID;
@@ -305,7 +340,7 @@ int deserialize_message(const uint8_t *buffer, size_t len, message_t *msg) {
     }
 
     /* Validate message type */
-    if (msg->header.type < 1 || msg->header.type > MSG_ERROR) {
+    if (msg->header.type < 1 || msg->header.type > MSG_RECONNECT_REQUEST) {
         LOG_ERROR("Invalid message type: %d", msg->header.type);
         return DSM_ERROR_INVALID;
     }
@@ -613,4 +648,128 @@ void network_shutdown(void) {
     }
 
     LOG_INFO("Network shutdown complete");
+}
+
+/**
+ * Prepare backup server without listening
+ *
+ * This function prepares a backup node (Node 1) to potentially become a manager
+ * by creating a server socket but not yet listening. The socket is set up and
+ * bound to the specified port, ready to be activated upon promotion.
+ *
+ * @param port Port to bind for future listening
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int network_prepare_backup_server(uint16_t port) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    LOG_INFO("Preparing backup server on port %u (not listening yet)", port);
+
+    /* Create socket */
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        LOG_ERROR("Failed to create backup server socket: %s", strerror(errno));
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Set SO_REUSEADDR to avoid "Address already in use" errors */
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOG_WARN("Failed to set SO_REUSEADDR: %s", strerror(errno));
+    }
+
+    /* Set SO_REUSEPORT to allow manager and backup to bind to same port */
+#ifdef SO_REUSEPORT
+    opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        LOG_WARN("Failed to set SO_REUSEPORT: %s (continuing anyway)", strerror(errno));
+        /* Not fatal - we can still work without pre-binding */
+    } else {
+        LOG_DEBUG("SO_REUSEPORT enabled for backup server socket");
+    }
+#else
+    LOG_WARN("SO_REUSEPORT not available - backup cannot pre-bind to manager port");
+    LOG_WARN("Failover will have slight delay while binding socket");
+    /* Don't attempt to bind - just close and return success */
+    close(sockfd);
+    return DSM_SUCCESS;
+#endif
+
+    /* Bind to port */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("Failed to bind backup server socket to port %u: %s", port, strerror(errno));
+        close(sockfd);
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Store socket and port in BACKUP-specific fields (not regular server fields) */
+    pthread_mutex_lock(&ctx->lock);
+    ctx->network.backup_state.backup_server_sockfd = sockfd;
+    ctx->network.backup_state.backup_server_port = port;
+    pthread_mutex_unlock(&ctx->lock);
+
+    LOG_INFO("Backup server prepared on port %u (socket bound but not listening)", port);
+    return DSM_SUCCESS;
+}
+
+/**
+ * Activate backup server (start listening)
+ *
+ * This function activates a previously prepared backup server socket by calling
+ * listen() and starting to accept connections. This is called when a backup node
+ * promotes itself to manager.
+ *
+ * @return DSM_SUCCESS on success, error code on failure
+ */
+int network_activate_backup_server(void) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    pthread_mutex_lock(&ctx->lock);
+    int sockfd = ctx->network.backup_state.backup_server_sockfd;
+    uint16_t port = ctx->network.backup_state.backup_server_port;
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (sockfd < 0) {
+        LOG_ERROR("Cannot activate backup server: socket not prepared");
+        return DSM_ERROR_INVALID;
+    }
+
+    LOG_INFO("Activating backup server on port %u (starting to listen)", port);
+
+    /* Start listening for connections */
+    if (listen(sockfd, 10) < 0) {
+        LOG_ERROR("Failed to listen on backup server socket: %s", strerror(errno));
+        return DSM_ERROR_NETWORK;
+    }
+
+    /* Move backup socket to primary server socket position */
+    pthread_mutex_lock(&ctx->lock);
+    ctx->network.server_sockfd = sockfd;
+    ctx->network.server_port = port;
+    ctx->network.backup_state.backup_server_sockfd = -1;  /* Clear backup reference */
+    ctx->network.running = true;
+    pthread_mutex_unlock(&ctx->lock);
+
+    /* Start accept thread to handle incoming connections */
+    extern void* accept_thread(void *arg);
+    pthread_t accept_tid;
+    if (pthread_create(&accept_tid, NULL, accept_thread, NULL) != 0) {
+        LOG_ERROR("Failed to create accept thread");
+        pthread_mutex_lock(&ctx->lock);
+        ctx->network.running = false;
+        pthread_mutex_unlock(&ctx->lock);
+        return DSM_ERROR_INIT;
+    }
+
+    /* Detach accept thread so it runs independently */
+    pthread_detach(accept_tid);
+
+    LOG_INFO("Backup server activated and listening on port %u", port);
+    return DSM_SUCCESS;
 }

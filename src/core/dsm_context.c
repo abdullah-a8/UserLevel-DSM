@@ -76,6 +76,21 @@ int dsm_context_init(const dsm_config_t *config) {
     pthread_mutex_init(&ctx->network.sharer_tracker.lock, NULL);
     pthread_cond_init(&ctx->network.sharer_tracker.cv, NULL);
 
+    /* Initialize hot backup state */
+    ctx->network.backup_state.is_backup = false;
+    ctx->network.backup_state.is_primary_backup = false;
+    ctx->network.backup_state.is_promoted = false;
+    ctx->network.backup_state.current_manager = 0;  /* Node 0 is initial manager */
+    ctx->network.backup_state.last_sync_seq = 0;
+    ctx->network.backup_state.backup_directory = NULL;
+    ctx->network.backup_state.backup_server_sockfd = -1;
+    ctx->network.backup_state.backup_server_port = 0;
+    pthread_mutex_init(&ctx->network.backup_state.promotion_lock, NULL);
+    for (int i = 0; i < 256; i++) {
+        ctx->network.backup_state.backup_locks[i] = NULL;
+        ctx->network.backup_state.backup_barriers[i] = NULL;
+    }
+
     for (int i = 0; i < MAX_NODES; i++) {
         ctx->network.nodes[i].connected = false;
         ctx->network.nodes[i].sockfd = -1;
@@ -156,6 +171,19 @@ void dsm_context_cleanup(void) {
     /* Cleanup directory query tracker */
     pthread_mutex_destroy(&ctx->network.dir_tracker.lock);
     pthread_cond_destroy(&ctx->network.dir_tracker.cv);
+
+    /* Cleanup sharer query tracker */
+    pthread_mutex_destroy(&ctx->network.sharer_tracker.lock);
+    pthread_cond_destroy(&ctx->network.sharer_tracker.cv);
+
+    /* Cleanup hot backup state */
+    pthread_mutex_destroy(&ctx->network.backup_state.promotion_lock);
+    if (ctx->network.backup_state.backup_directory) {
+        /* Will be cast and freed properly in directory cleanup */
+        extern void directory_destroy(void *dir);
+        directory_destroy(ctx->network.backup_state.backup_directory);
+        ctx->network.backup_state.backup_directory = NULL;
+    }
 
     if (ctx->network.server_sockfd >= 0) {
         close(ctx->network.server_sockfd);

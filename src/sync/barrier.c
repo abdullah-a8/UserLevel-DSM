@@ -198,6 +198,11 @@ int barrier_manager_arrive(barrier_id_t barrier_id, node_id_t arriver, int num_p
     LOG_DEBUG("Manager: Node %u arrived at barrier %lu (count=%d/%d)",
               arriver, barrier_id, barrier->arrived_count, barrier->expected_count);
 
+    /* Capture state for replication after arrival */
+    int arrived_copy = barrier->arrived_count;
+    int expected_copy = barrier->expected_count;
+    uint64_t generation_copy = barrier->generation;
+
     if (barrier->arrived_count >= barrier->expected_count) {
         /* All participants arrived, release everyone */
         LOG_INFO("Manager: All %d participants arrived at barrier %lu, releasing",
@@ -220,12 +225,29 @@ int barrier_manager_arrive(barrier_id_t barrier_id, node_id_t arriver, int num_p
         /* Reset barrier for reuse */
         barrier->arrived_count = 0;
 
+        /* Capture state for replication after release */
+        int arrived_after = barrier->arrived_count;
+        int expected_after = barrier->expected_count;
+        uint64_t generation_after = barrier->generation;
+
         /* Wake up any local threads waiting on this barrier */
         pthread_cond_broadcast(&barrier->all_arrived_cv);
 
         pthread_mutex_unlock(&barrier->lock);
+
+        /* Replicate barrier state to backup (after release) */
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_barrier(barrier_id_t barrier_id, int num_arrived, int num_expected, uint64_t generation);
+            send_state_sync_barrier(barrier_id, arrived_after, expected_after, generation_after);
+        }
     } else {
         pthread_mutex_unlock(&barrier->lock);
+
+        /* Replicate barrier state to backup (after arrival, not yet released) */
+        if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+            extern int send_state_sync_barrier(barrier_id_t barrier_id, int num_arrived, int num_expected, uint64_t generation);
+            send_state_sync_barrier(barrier_id, arrived_copy, expected_copy, generation_copy);
+        }
     }
 
     return DSM_SUCCESS;

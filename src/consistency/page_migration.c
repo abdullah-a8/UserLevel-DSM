@@ -20,6 +20,60 @@
 /* Global page directory (managed by manager node or replicated) */
 static page_directory_t *g_directory = NULL;
 
+/**
+ * Wait for manager reconnection after failover
+ * Called when manager (Node 0) has failed and we're waiting for backup promotion
+ *
+ * @param timeout_ms Timeout in milliseconds
+ * @return DSM_SUCCESS if new manager is ready, DSM_ERROR_TIMEOUT if timeout
+ */
+static int wait_for_manager_reconnection(int timeout_ms) {
+    dsm_context_t *ctx = dsm_get_context();
+
+    LOG_INFO("Waiting for manager reconnection (timeout=%dms)...", timeout_ms);
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* Wait for either:
+     * 1. Manager (Node 0) to recover (unlikely in hot backup scenario)
+     * 2. Backup (Node 1) to promote and become new manager
+     */
+    while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                         (now.tv_nsec - start.tv_nsec) / 1000000;
+
+        if (elapsed_ms >= timeout_ms) {
+            LOG_ERROR("Timeout waiting for manager reconnection (%ld ms elapsed)", elapsed_ms);
+            return DSM_ERROR_TIMEOUT;
+        }
+
+        pthread_mutex_lock(&ctx->lock);
+
+        /* Check if Node 0 has recovered */
+        if (!ctx->network.nodes[0].is_failed) {
+            pthread_mutex_unlock(&ctx->lock);
+            LOG_INFO("Manager (Node 0) has recovered");
+            return DSM_SUCCESS;
+        }
+
+        /* Check if backup has promoted (current_manager changed from 0) */
+        if (ctx->network.backup_state.current_manager != 0 &&
+            ctx->network.backup_state.current_manager != (node_id_t)-1) {
+            node_id_t new_manager = ctx->network.backup_state.current_manager;
+            pthread_mutex_unlock(&ctx->lock);
+            LOG_INFO("Backup (Node %u) has promoted to manager", new_manager);
+            return DSM_SUCCESS;
+        }
+
+        pthread_mutex_unlock(&ctx->lock);
+
+        /* Sleep briefly before checking again */
+        usleep(100000);  /* 100ms */
+    }
+}
+
 int consistency_init(size_t num_pages) {
     if (g_directory) {
         LOG_WARN("Consistency module already initialized");
@@ -45,6 +99,11 @@ void consistency_cleanup(void) {
 
 page_directory_t* get_page_directory(void) {
     return g_directory;
+}
+
+void set_page_directory(page_directory_t *dir) {
+    g_directory = dir;
+    LOG_INFO("Page directory updated (failover support)");
 }
 
 int fetch_page_read(page_id_t page_id) {
@@ -88,7 +147,29 @@ int fetch_page_read(page_id_t page_id) {
         node_id_t owner;
         int rc = query_directory_manager(page_id, &owner);
         if (rc != DSM_SUCCESS) {
-            LOG_ERROR("Failed to lookup page %lu in directory", page_id);
+            /* PHASE 7: Check if manager failed and wait for promotion */
+            if (rc == DSM_ERROR_TIMEOUT) {
+                pthread_mutex_lock(&ctx->lock);
+                bool manager_failed = ctx->network.nodes[0].is_failed;
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (manager_failed) {
+                    LOG_INFO("Manager failed during directory query, waiting for promotion...");
+                    int wait_rc = wait_for_manager_reconnection(5000);  /* 5 sec timeout */
+                    if (wait_rc == DSM_SUCCESS) {
+                        LOG_INFO("New manager ready, retrying directory query");
+                        retries++;
+                        usleep(100000);  /* Brief pause before retry */
+                        continue;  /* Retry with new manager */
+                    } else {
+                        LOG_ERROR("Timeout waiting for manager promotion");
+                        final_result = DSM_ERROR_TIMEOUT;
+                        goto cleanup;
+                    }
+                }
+            }
+
+            LOG_ERROR("Failed to lookup page %lu in directory (rc=%d)", page_id, rc);
             final_result = rc;
             goto cleanup;
         }
@@ -330,7 +411,29 @@ int fetch_page_write(page_id_t page_id) {
         node_id_t owner;
         int rc = query_directory_manager(page_id, &owner);
         if (rc != DSM_SUCCESS) {
-            LOG_ERROR("Failed to lookup page %lu in directory", page_id);
+            /* PHASE 7: Check if manager failed and wait for promotion */
+            if (rc == DSM_ERROR_TIMEOUT) {
+                pthread_mutex_lock(&ctx->lock);
+                bool manager_failed = ctx->network.nodes[0].is_failed;
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (manager_failed) {
+                    LOG_INFO("Manager failed during directory query (WRITE), waiting for promotion...");
+                    int wait_rc = wait_for_manager_reconnection(5000);  /* 5 sec timeout */
+                    if (wait_rc == DSM_SUCCESS) {
+                        LOG_INFO("New manager ready, retrying directory query for WRITE");
+                        retries++;
+                        usleep(100000);  /* Brief pause before retry */
+                        continue;  /* Retry with new manager */
+                    } else {
+                        LOG_ERROR("Timeout waiting for manager promotion (WRITE)");
+                        final_result = DSM_ERROR_TIMEOUT;
+                        goto cleanup;
+                    }
+                }
+            }
+
+            LOG_ERROR("Failed to lookup page %lu in directory for WRITE (rc=%d)", page_id, rc);
             final_result = rc;
             goto cleanup;
         }
@@ -654,9 +757,13 @@ int fetch_page_write(page_id_t page_id) {
         entry->state = PAGE_STATE_READ_WRITE;
         entry->owner = ctx->node_id;
 
-        /* Send OWNER_UPDATE to manager */
-        if (ctx->node_id != 0) {
-            send_owner_update(0, page_id, ctx->node_id);
+        /* PHASE 7: Send OWNER_UPDATE to current manager (could be promoted backup) */
+        node_id_t manager_id = 0;
+        if (ctx->network.backup_state.current_manager != (node_id_t)-1) {
+            manager_id = ctx->network.backup_state.current_manager;
+        }
+        if (ctx->node_id != manager_id && !ctx->config.is_manager) {
+            send_owner_update(manager_id, page_id, ctx->node_id);
         }
 
         LOG_DEBUG("Successfully fetched page %lu for write", page_id);

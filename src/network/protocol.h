@@ -47,7 +47,14 @@ typedef enum {
     MSG_NODE_FAILED,           /**< Notify of node failure */
     MSG_SHARER_QUERY,          /**< Query owner for page sharers */
     MSG_SHARER_REPLY,          /**< Reply with page sharers list */
-    MSG_ERROR                  /**< Error response */
+    MSG_ERROR,                 /**< Error response */
+    /* Hot backup failover messages */
+    MSG_STATE_SYNC_DIR,        /**< Replicate directory entry */
+    MSG_STATE_SYNC_LOCK,       /**< Replicate lock state */
+    MSG_STATE_SYNC_BARRIER,    /**< Replicate barrier state */
+    MSG_STATE_SYNC_NODE,       /**< Replicate node metadata */
+    MSG_MANAGER_PROMOTION,     /**< Backup announces promotion */
+    MSG_RECONNECT_REQUEST      /**< Worker requests reconnection */
 } msg_type_t;
 
 /* ============================ */
@@ -255,6 +262,72 @@ typedef struct {
     char error_msg[256];       /**< Error description */
 } __attribute__((packed)) error_payload_t;
 
+/**
+ * STATE_SYNC_DIR message payload
+ * Replicates directory entry state to backup nodes
+ */
+typedef struct {
+    uint64_t sync_seq;         /**< Sequence number for ordering */
+    page_id_t page_id;         /**< Page ID */
+    node_id_t owner;           /**< Current owner node ID */
+    int num_sharers;           /**< Number of sharers */
+    node_id_t sharers[MAX_SHARERS]; /**< List of sharer node IDs */
+} __attribute__((packed)) state_sync_dir_payload_t;
+
+/**
+ * STATE_SYNC_LOCK message payload
+ * Replicates lock state to backup nodes
+ */
+typedef struct {
+    uint64_t sync_seq;         /**< Sequence number for ordering */
+    lock_id_t lock_id;         /**< Lock identifier */
+    node_id_t holder;          /**< Current lock holder (or -1 if free) */
+    int num_waiters;           /**< Number of waiters in queue */
+    node_id_t waiters[32];     /**< FIFO queue of waiters */
+} __attribute__((packed)) state_sync_lock_payload_t;
+
+/**
+ * STATE_SYNC_BARRIER message payload
+ * Replicates barrier state to backup nodes
+ */
+typedef struct {
+    uint64_t sync_seq;         /**< Sequence number for ordering */
+    barrier_id_t barrier_id;   /**< Barrier identifier */
+    int num_arrived;           /**< Number of participants arrived */
+    int num_expected;          /**< Total expected participants */
+    uint64_t generation;       /**< Barrier generation number */
+} __attribute__((packed)) state_sync_barrier_payload_t;
+
+/**
+ * STATE_SYNC_NODE message payload
+ * Replicates node metadata to backup nodes
+ */
+typedef struct {
+    uint64_t sync_seq;         /**< Sequence number for ordering */
+    node_id_t node_id;         /**< Node ID */
+    bool connected;            /**< Is node connected? */
+    bool is_failed;            /**< Is node failed? */
+} __attribute__((packed)) state_sync_node_payload_t;
+
+/**
+ * MANAGER_PROMOTION message payload
+ * Broadcast by backup when it promotes to manager
+ */
+typedef struct {
+    node_id_t new_manager_id;  /**< New manager node ID (promoted backup) */
+    node_id_t old_manager_id;  /**< Old manager node ID (failed) */
+    uint64_t promotion_time;   /**< Timestamp of promotion */
+} __attribute__((packed)) manager_promotion_payload_t;
+
+/**
+ * RECONNECT_REQUEST message payload
+ * Sent by workers to reconnect to new manager after failover
+ */
+typedef struct {
+    node_id_t requester_id;    /**< Requesting node ID */
+    uint64_t last_seq_seen;    /**< Last sequence number seen from old manager */
+} __attribute__((packed)) reconnect_request_payload_t;
+
 /* ============================ */
 /*     Complete Message         */
 /* ============================ */
@@ -288,6 +361,13 @@ typedef struct {
         sharer_query_payload_t sharer_query;
         sharer_reply_payload_t sharer_reply;
         error_payload_t error;
+        /* Hot backup failover payloads */
+        state_sync_dir_payload_t state_sync_dir;
+        state_sync_lock_payload_t state_sync_lock;
+        state_sync_barrier_payload_t state_sync_barrier;
+        state_sync_node_payload_t state_sync_node;
+        manager_promotion_payload_t manager_promotion;
+        reconnect_request_payload_t reconnect_request;
         uint8_t raw[PAGE_SIZE + 256]; /**< Raw buffer for largest payload */
     } payload;
 } message_t;

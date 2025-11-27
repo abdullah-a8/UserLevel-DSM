@@ -66,4 +66,11 @@ void consistency_cleanup(void);
  */
 struct page_directory_s* get_page_directory(void);
 
+/**
+ * Set global page directory (for failover support)
+ *
+ * @param dir New page directory pointer
+ */
+void set_page_directory(struct page_directory_s *dir);
+
 #endif /* PAGE_MIGRATION_H */

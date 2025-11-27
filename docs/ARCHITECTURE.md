@@ -24,13 +24,23 @@ This is a user-space implementation of Distributed Shared Memory that provides t
 - Maintains centralized page directory (ownership and sharer tracking)
 - Coordinates distributed locks and barriers
 - Broadcasts allocation notifications
+- Replicates state to primary backup for fault tolerance
 
-**Worker Nodes (Node 1+):**
+**Primary Backup Node (Node 1):**
+
+- Functions as worker for application workload
+- Maintains shadow directory, locks, and barriers
+- Receives asynchronous state replication from manager
+- Promotes to manager on Node 0 failure
+- Pre-binds to manager port for seamless failover
+
+**Worker Nodes (Node 2+):**
 
 - Connect to manager via TCP client
 - Local page table tracking
 - Send page requests and receive data
 - Participate in synchronization
+- Redirect to new manager on failover
 
 ### Core Components
 
@@ -325,6 +335,9 @@ typedef struct {
 - `SHARER_QUERY` / `SHARER_REPLY`: Get complete sharer list
 - `HEARTBEAT`: Failure detection
 - `NODE_JOIN` / `NODE_FAILED`: Membership
+- `STATE_SYNC_DIR` / `STATE_SYNC_LOCK` / `STATE_SYNC_BARRIER`: Hot backup replication
+- `MANAGER_PROMOTION`: Notify workers of new manager
+- `RECONNECT_REQUEST`: Worker reconnection after failover
 
 **Request/Response Tracking:**
 
@@ -406,25 +419,103 @@ typedef struct {
 - On completion, broadcasts to wake all waiters
 - Waiters check result and either succeed or retry
 
-## Failure Handling
+## Fault Tolerance
 
-### Heartbeat Mechanism
+### Hot Backup Architecture
+
+The system implements **hot backup failover** with Node 1 as primary backup for manager (Node 0).
+
+**Key Components:**
+
+- **Shadow Directory**: Node 1 maintains replicated copy of page directory (100K buckets)
+- **Shadow Locks**: Replicated state for all distributed locks (256 max)
+- **Shadow Barriers**: Replicated state for all barriers (256 max)
+- **Promotion Lock**: Prevents split-brain scenarios during failover
+- **Backup Server Socket**: Pre-bound to manager port for instant takeover
+
+### State Replication
+
+**Manager → Backup Synchronization:**
+
+After each state-modifying operation, manager asynchronously replicates to Node 1:
+
+1. **Directory Operations** (in `directory.c`):
+   - `directory_add_reader()` → Send `STATE_SYNC_DIR` with page_id, owner, sharers
+   - `directory_set_writer()` → Send `STATE_SYNC_DIR` with updated ownership
+   - `directory_clear_sharers()` → Send `STATE_SYNC_DIR` with empty sharer list
+   - `directory_set_owner()` → Send `STATE_SYNC_DIR` with new owner
+
+2. **Lock Operations**:
+   - Lock acquire/release → Send `STATE_SYNC_LOCK` with holder and waiter queue
+
+3. **Barrier Operations**:
+   - Barrier arrive → Send `STATE_SYNC_BARRIER` with arrival count and generation
+
+**Replication Properties:**
+
+- **Asynchronous**: Non-blocking to avoid performance impact
+- **Sequenced**: Each update carries `sync_seq` for ordering
+- **Conditional**: Only when manager is Node 0 and not promoted backup
+- **Single-target**: Only to Node 1 (primary backup)
+
+### Failover Protocol
+
+**Detection Phase:**
+
+1. Heartbeat thread detects Node 0 failure (missed heartbeats exceed threshold)
+2. Node 1 checks `is_primary_backup` flag
+3. Acquires `promotion_lock` to prevent concurrent promotions
+
+**Promotion Phase:**
+
+1. Node 1 swaps shadow directory to active: `set_page_directory(backup_directory)`
+2. Sets flags: `is_promoted = true`, `current_manager = 1`
+3. Activates pre-bound backup server socket to accept connections
+4. Broadcasts `MANAGER_PROMOTION` to all workers with new manager ID and timestamp
+
+**Worker Reconnection Phase:**
+
+1. Workers receive `MANAGER_PROMOTION` notification
+2. Update local `current_manager` tracking to Node 1
+3. Send `RECONNECT_REQUEST` with last sequence seen
+4. Redirect all directory queries to Node 1
+5. Retry pending operations with new manager
+
+**Transparent Recovery:**
+
+- Page fetch operations (`fetch_page_read/write`) detect manager timeout
+- Check if Node 0 failed via `ctx->network.nodes[0].is_failed`
+- Call `wait_for_manager_reconnection(5000ms)` polling for promotion
+- Retry operations automatically with promoted manager
+- No application-level intervention required
+
+### Failure Handling
+
+**Heartbeat Mechanism:**
 
 - Separate thread sends periodic `HEARTBEAT` messages
 - Tracks `last_heartbeat_time` and `missed_heartbeats` per node
 - After threshold, mark node as failed via `is_failed` flag
+- Triggers promotion logic if failed node is manager
 
-### Directory Recovery
+**Directory Recovery:**
 
-**On node failure:**
+**On worker node failure:**
 
 - `directory_handle_node_failure()`: Remove from all sharer lists, mark owned pages as orphaned
 - `directory_reclaim_ownership()`: Requester can claim ownership on timeout
 
-**Timeout handling:**
+**On manager failure:**
+
+- Primary backup promotes to manager role
+- Workers redirect to Node 1 via `current_manager` tracking
+- Pending operations retry with new manager after promotion completes
+
+**Timeout Handling:**
 
 - Page requests timeout after 5-30 seconds
-- Retry up to 3 times with exponential backoff
+- Detects manager failure and waits for promotion before retry
+- Retries up to 3 times with exponential backoff
 - Update stats: `ctx->stats.timeouts++`, `ctx->stats.network_failures++`
 
 ## Performance Features
@@ -531,6 +622,8 @@ Thread accesses page → SIGSEGV → Handler extracts address
 | Consistency        | Single-Writer/Multiple-Reader | Simplest invalidation protocol, avoids write conflicts            |
 | Directory          | Centralized on Node 0         | Simpler than distributed directory, acceptable for small clusters |
 | Locks/Barriers     | Centralized on Node 0         | Easier implementation, single point of coordination               |
+| Fault tolerance    | Hot backup (Node 1)           | Fast failover with replicated state, no checkpoint overhead       |
+| Replication        | Asynchronous to Node 1        | Low latency impact, acceptable staleness for manager failover     |
 | Network            | TCP                           | Reliability over raw performance                                  |
 | Virtual addresses  | SVAS (same on all nodes)      | Simplifies pointer sharing, required for true DSM                 |
 | Fault detection    | `SIGSEGV` signal handler      | Only user-space mechanism available                               |
@@ -541,7 +634,8 @@ Thread accesses page → SIGSEGV → Handler extracts address
 
 - **Scalability**: Centralized directory and lock manager limit cluster size
 - **Single-writer**: No write-write sharing (MSI/MESI would be more sophisticated)
-- **Failure**: Limited tolerance—node failures detected but recovery is basic
+- **Single backup**: Only Node 1 serves as backup; no failover for backup itself
+- **Replication lag**: Asynchronous replication may lose in-flight state during failure
 - **Performance**: Network latency dominates (no prefetching or adaptive policies)
 - **Max allocations**: 32 per node
 - **Max sharers**: 16 per page

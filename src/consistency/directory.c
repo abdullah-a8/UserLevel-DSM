@@ -162,7 +162,23 @@ int directory_add_reader(page_directory_t *dir, page_id_t page_id, node_id_t rea
         return DSM_ERROR_BUSY;
     }
 
+    /* Capture state for replication */
+    node_id_t owner_copy = entry->owner;
+    int num_sharers = entry->sharers.count;
+    node_id_t sharers_copy[MAX_SHARERS];
+    for (int i = 0; i < num_sharers; i++) {
+        sharers_copy[i] = entry->sharers.nodes[i];
+    }
+
     pthread_mutex_unlock(&entry->lock);
+
+    /* Replicate to backup */
+    dsm_context_t *ctx = dsm_get_context();
+    if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+        extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+        send_state_sync_dir(page_id, owner_copy, sharers_copy, num_sharers);
+    }
+
     return DSM_SUCCESS;
 }
 
@@ -211,7 +227,22 @@ int directory_set_writer(page_directory_t *dir, page_id_t page_id, node_id_t wri
     LOG_DEBUG("Set node %u as writer for page %lu (%d nodes to invalidate)",
               writer, page_id, *num_invalidate);
 
+    /* Capture state for replication */
+    int num_sharers = entry->sharers.count;
+    node_id_t sharers_copy[MAX_SHARERS];
+    for (int i = 0; i < num_sharers; i++) {
+        sharers_copy[i] = entry->sharers.nodes[i];
+    }
+
     pthread_mutex_unlock(&entry->lock);
+
+    /* Replicate to backup */
+    dsm_context_t *ctx = dsm_get_context();
+    if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+        extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+        send_state_sync_dir(page_id, writer, sharers_copy, num_sharers);
+    }
+
     return DSM_SUCCESS;
 }
 
@@ -228,8 +259,16 @@ int directory_clear_sharers(page_directory_t *dir, page_id_t page_id) {
 
     pthread_mutex_lock(&entry->lock);
     entry->sharers.count = 0;
+    node_id_t owner_copy = entry->owner;
     LOG_DEBUG("Cleared sharer list for page %lu", page_id);
     pthread_mutex_unlock(&entry->lock);
+
+    /* Replicate to backup */
+    dsm_context_t *ctx = dsm_get_context();
+    if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+        extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+        send_state_sync_dir(page_id, owner_copy, NULL, 0);
+    }
 
     return DSM_SUCCESS;
 }
@@ -301,7 +340,22 @@ int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owne
 
     pthread_mutex_lock(&entry->lock);
     entry->owner = owner;
+
+    /* Capture sharers for replication */
+    int num_sharers = entry->sharers.count;
+    node_id_t sharers_copy[MAX_SHARERS];
+    for (int i = 0; i < num_sharers; i++) {
+        sharers_copy[i] = entry->sharers.nodes[i];
+    }
+
     pthread_mutex_unlock(&entry->lock);
+
+    /* Replicate to backup (if manager and not promoted) */
+    dsm_context_t *ctx = dsm_get_context();
+    if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
+        extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+        send_state_sync_dir(page_id, owner, sharers_copy, num_sharers);
+    }
 
     return DSM_SUCCESS;
 }
@@ -430,8 +484,8 @@ int directory_reclaim_ownership(page_directory_t *dir, page_id_t page_id, node_i
 int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     dsm_context_t *ctx = dsm_get_context();
 
-    /* If we are the manager (Node 0), query local directory */
-    if (ctx->node_id == 0) {
+    /* PHASE 7: Check if we are the manager (could be Node 0 or promoted backup) */
+    if (ctx->config.is_manager || ctx->network.backup_state.is_promoted) {
         page_directory_t *dir = get_page_directory();
         return directory_lookup(dir, page_id, owner);
     }
@@ -439,8 +493,16 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     /* If not manager, query manager via network */
     pthread_mutex_lock(&ctx->network.dir_tracker.lock);
 
-    LOG_INFO("Querying directory for page %lu (active=%d, complete=%d) from thread %d",
-             page_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete,
+    /* PHASE 7: Determine current manager (could be promoted backup) */
+    node_id_t manager_id = 0;  /* Default to Node 0 */
+    if (ctx->network.backup_state.current_manager != (node_id_t)-1 &&
+        ctx->network.backup_state.current_manager != 0) {
+        manager_id = ctx->network.backup_state.current_manager;
+        LOG_DEBUG("Using promoted manager Node %u instead of Node 0", manager_id);
+    }
+
+    LOG_INFO("Querying directory for page %lu from manager Node %u (active=%d, complete=%d) from thread %d",
+             page_id, manager_id, ctx->network.dir_tracker.active, ctx->network.dir_tracker.complete,
              (int)pthread_self());
 
     /* Setup tracker */
@@ -448,8 +510,8 @@ int query_directory_manager(page_id_t page_id, node_id_t *owner) {
     ctx->network.dir_tracker.active = true;
     ctx->network.dir_tracker.complete = false;
 
-    /* Send query */
-    int rc = send_dir_query(0, page_id);
+    /* Send query to current manager */
+    int rc = send_dir_query(manager_id, page_id);
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to send DIR_QUERY for page %lu", page_id);
         ctx->network.dir_tracker.active = false;

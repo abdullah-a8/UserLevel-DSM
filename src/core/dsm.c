@@ -9,6 +9,7 @@
 #include "perf_log.h"
 #include "../memory/fault_handler.h"
 #include "../consistency/page_migration.h"
+#include "../consistency/directory.h"
 #include "../network/network.h"
 #include "../network/handlers.h"
 #include <stdlib.h>
@@ -138,6 +139,58 @@ int dsm_init(const dsm_config_t *config) {
         }
     }
 
+    /* PHASE 9: Initialize backup state for Node 1 (primary backup) */
+    if (config->node_id == 1) {
+        LOG_INFO("Initializing Node 1 as primary backup for hot failover");
+
+        dsm_context_t *ctx = dsm_get_context();
+        pthread_mutex_lock(&ctx->lock);
+
+        /* Set backup flags */
+        ctx->network.backup_state.is_backup = true;
+        ctx->network.backup_state.is_primary_backup = true;
+        ctx->network.backup_state.is_promoted = false;
+        ctx->network.backup_state.current_manager = 0;  /* Node 0 is initial manager */
+        ctx->network.backup_state.last_sync_seq = 0;
+
+        /* Create shadow directory structure for replication (100K buckets as per plan) */
+        ctx->network.backup_state.backup_directory = directory_create(100000);
+        if (!ctx->network.backup_state.backup_directory) {
+            LOG_ERROR("Failed to create backup directory");
+            pthread_mutex_unlock(&ctx->lock);
+            network_shutdown();
+            uninstall_fault_handler();
+            dsm_context_cleanup();
+            return DSM_ERROR_MEMORY;
+        }
+
+        /* Initialize shadow lock structures (256 locks max) */
+        for (int i = 0; i < 256; i++) {
+            ctx->network.backup_state.backup_locks[i] = NULL;  /* Lazy allocation */
+        }
+
+        /* Initialize shadow barrier structures (256 barriers max) */
+        for (int i = 0; i < 256; i++) {
+            ctx->network.backup_state.backup_barriers[i] = NULL;  /* Lazy allocation */
+        }
+
+        /* Initialize promotion lock to prevent split-brain */
+        pthread_mutex_init(&ctx->network.backup_state.promotion_lock, NULL);
+
+        pthread_mutex_unlock(&ctx->lock);
+
+        /* Prepare backup server socket (bind but don't listen yet) */
+        /* IMPORTANT: Bind to manager's port, not this node's port! */
+        uint16_t manager_port = config->manager_port;  /* Port manager listens on */
+        rc = network_prepare_backup_server(manager_port);
+        if (rc != DSM_SUCCESS) {
+            LOG_WARN("Failed to prepare backup server socket on port %u (rc=%d), continuing anyway", manager_port, rc);
+            /* Not fatal - can still function as backup without pre-bound socket */
+        }
+
+        LOG_INFO("Node 1 initialized as primary backup (shadow directory created, promotion lock initialized)");
+    }
+
     /* Note: consistency module will be initialized when dsm_malloc() creates page table */
 
     LOG_INFO("DSM initialized successfully");
@@ -147,8 +200,41 @@ int dsm_init(const dsm_config_t *config) {
 int dsm_finalize(void) {
     LOG_INFO("Finalizing DSM");
 
-    /* Shutdown network first */
     dsm_context_t *ctx = dsm_get_context();
+
+    /* PHASE 9: Cleanup backup state if this is Node 1 */
+    if (ctx->config.node_id == 1 && ctx->network.backup_state.is_backup) {
+        LOG_INFO("Cleaning up backup state for Node 1");
+
+        /* Destroy shadow directory */
+        if (ctx->network.backup_state.backup_directory) {
+            directory_destroy((page_directory_t*)ctx->network.backup_state.backup_directory);
+            ctx->network.backup_state.backup_directory = NULL;
+        }
+
+        /* Destroy shadow locks (if any were allocated) */
+        for (int i = 0; i < 256; i++) {
+            if (ctx->network.backup_state.backup_locks[i]) {
+                free(ctx->network.backup_state.backup_locks[i]);
+                ctx->network.backup_state.backup_locks[i] = NULL;
+            }
+        }
+
+        /* Destroy shadow barriers (if any were allocated) */
+        for (int i = 0; i < 256; i++) {
+            if (ctx->network.backup_state.backup_barriers[i]) {
+                free(ctx->network.backup_state.backup_barriers[i]);
+                ctx->network.backup_state.backup_barriers[i] = NULL;
+            }
+        }
+
+        /* Destroy promotion lock */
+        pthread_mutex_destroy(&ctx->network.backup_state.promotion_lock);
+
+        LOG_INFO("Backup state cleanup complete");
+    }
+
+    /* Shutdown network first */
     if (ctx->config.num_nodes > 1) {
         network_shutdown();
     }

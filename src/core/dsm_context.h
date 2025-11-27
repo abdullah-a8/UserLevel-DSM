@@ -94,6 +94,21 @@ typedef struct {
         bool active;
         bool complete;
     } sharer_tracker;
+
+    /* Hot backup state (for failover support) */
+    struct {
+        bool is_backup;                        /**< True for Node 1 & 2 */
+        bool is_primary_backup;                /**< True for Node 1 only */
+        bool is_promoted;                      /**< True after promotion */
+        node_id_t current_manager;             /**< Track active manager */
+        uint64_t last_sync_seq;                /**< Replication sequence */
+        void *backup_directory;                /**< Shadow directory (page_directory_t*) */
+        void *backup_locks[256];               /**< Shadow locks (dsm_lock_t*) */
+        void *backup_barriers[256];            /**< Shadow barriers (dsm_barrier_t*) */
+        pthread_mutex_t promotion_lock;        /**< Prevent split-brain */
+        int backup_server_sockfd;              /**< Backup server socket (separate from worker socket) */
+        uint16_t backup_server_port;           /**< Port for backup server */
+    } backup_state;
 } network_state_t;
 
 /**
