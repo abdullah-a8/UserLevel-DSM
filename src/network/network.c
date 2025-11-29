@@ -118,6 +118,12 @@ static void* accept_thread(void *arg) {
                  ntohs(client_addr.sin_port),
                  client_fd);
 
+        /* Set socket timeouts to prevent indefinite blocking */
+        struct timeval send_tv = {.tv_sec = 5, .tv_usec = 0};  /* 5 second send timeout */
+        struct timeval recv_tv = {.tv_sec = 30, .tv_usec = 0}; /* 30 second recv timeout */
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+
         /* Add to pending connections list - will be moved to nodes[] when NODE_JOIN is received */
         pthread_mutex_lock(&ctx->network.pending_lock);
         if (ctx->network.num_pending < MAX_NODES) {
@@ -168,6 +174,12 @@ int network_connect_to_node(node_id_t node_id, const char *hostname, uint16_t po
         close(sockfd);
         return DSM_ERROR_NETWORK;
     }
+
+    /* Set socket timeouts to prevent indefinite blocking */
+    struct timeval send_tv = {.tv_sec = 5, .tv_usec = 0};  /* 5 second send timeout */
+    struct timeval recv_tv = {.tv_sec = 30, .tv_usec = 0}; /* 30 second recv timeout */
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
 
     /* Store connection */
     pthread_mutex_lock(&ctx->lock);
