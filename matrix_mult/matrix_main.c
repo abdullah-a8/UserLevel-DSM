@@ -130,25 +130,22 @@ int main(int argc, char *argv[]) {
     
     /* PHASE 1: Allocation */
     display_section("PHASE 1: Memory Allocation");
-    
-    for (int i = 0; i < num_nodes; i++) {
-        if (node_id == i) {
-            display_action(node_id, ICON_MEM, "Allocating my partitions (A and C)...");
-            if (matrix_allocate_my_partitions(&state) != 0) {
-                display_action(node_id, ICON_CROSS, "Allocation failed");
-                dsm_finalize();
-                return 1;
-            }
-            double kb = (state.rows_per_node[i] * N * sizeof(double)) / 1024.0;
-            snprintf(info_msg, sizeof(info_msg), "Allocated %.1f KB per matrix", kb);
-            display_action(node_id, ICON_CHECK, info_msg);
-        }
-        dsm_barrier(BARRIER_ALLOC_A_BASE + i, num_nodes);
-        if (node_id == 0 && i > 0) {
-            display_barrier(BARRIER_ALLOC_A_BASE + i, num_nodes);
-        }
+
+    /* Each node allocates its own A and C partitions (in parallel) */
+    display_action(node_id, ICON_MEM, "Allocating my partitions (A and C)...");
+    if (matrix_allocate_my_partitions(&state) != 0) {
+        display_action(node_id, ICON_CROSS, "Allocation failed");
+        dsm_finalize();
+        return 1;
     }
-    
+    double kb = (state.rows_per_node[node_id] * N * sizeof(double)) / 1024.0;
+    snprintf(info_msg, sizeof(info_msg), "Allocated %.1f KB per matrix", kb);
+    display_action(node_id, ICON_CHECK, info_msg);
+
+    /* Wait for all nodes to complete their allocations */
+    dsm_barrier(BARRIER_ALLOC_A_BASE, num_nodes);
+    display_barrier(BARRIER_ALLOC_A_BASE, num_nodes);
+
     display_divider();
     
     if (node_id == 0) {
