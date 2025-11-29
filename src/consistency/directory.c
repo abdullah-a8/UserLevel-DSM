@@ -350,11 +350,19 @@ int directory_set_owner(page_directory_t *dir, page_id_t page_id, node_id_t owne
 
     pthread_mutex_unlock(&entry->lock);
 
-    /* Replicate to backup (if manager and not promoted) */
+    /* Replicate to backup (if manager and not promoted)
+     * NOTE: This is done AFTER releasing the entry lock to avoid blocking
+     * the directory while sending network messages. The state sync is
+     * best-effort and shouldn't block critical path operations. */
     dsm_context_t *ctx = dsm_get_context();
     if (ctx->config.is_manager && !ctx->network.backup_state.is_promoted) {
-        extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
-        send_state_sync_dir(page_id, owner, sharers_copy, num_sharers);
+        /* Only sync if backup is connected and not during initial allocation burst
+         * to avoid blocking the allocation path */
+        if (ctx->network.nodes[1].connected && !ctx->network.nodes[1].is_failed) {
+            extern int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sharers, int num_sharers);
+            /* Fire and forget - don't block on result */
+            send_state_sync_dir(page_id, owner, sharers_copy, num_sharers);
+        }
     }
 
     return DSM_SUCCESS;

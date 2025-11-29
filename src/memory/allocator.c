@@ -72,16 +72,6 @@ void* dsm_malloc(size_t size) {
         ctx->page_table = new_table;
 
         /* Initialize consistency module now that first page table exists */
-        /* Note: We use a hash table with 100K buckets for the page directory.
-         * This provides good performance while using minimal memory (~8 MB for buckets).
-         * Entries are created on-demand when pages are accessed, so actual memory usage
-         * depends on the number of pages in use, not the maximum possible page ID.
-         *
-         * Memory usage: 100K buckets * 8 bytes/pointer = 800 KB
-         * Plus: ~128 bytes per actual page entry (allocated on demand)
-         * Example: 10K pages in use = 800 KB + 10K * 128 bytes = ~2 MB total
-         *
-         * This is a huge improvement over the previous 1.9 GB fixed allocation! */
         int rc = consistency_init(100000);
         if (rc != DSM_SUCCESS && rc != DSM_ERROR_INIT) {
             LOG_ERROR("Failed to initialize consistency module");
@@ -95,9 +85,16 @@ void* dsm_malloc(size_t size) {
         }
     }
 
-    /* Set this node as owner of all allocated pages */
+    /* Set this node as owner of all allocated pages
+     * NOTE: We temporarily disable state sync during this loop to avoid
+     * blocking on network sends while holding ctx->lock. State will be
+     * synced when pages are actually accessed (on demand). */
     struct page_directory_s *dir = get_page_directory();
     if (dir) {
+        /* Temporarily disable backup sync during batch allocation */
+        bool was_manager = ctx->config.is_manager;
+        ctx->config.is_manager = false;  /* Disable sync temporarily */
+        
         for (size_t i = 0; i < num_pages; i++) {
             page_id_t global_page_id = new_table->entries[i].id;
 
@@ -107,6 +104,8 @@ void* dsm_malloc(size_t size) {
             /* Set owner in page table (ctx->lock already held) */
             new_table->entries[i].owner = ctx->node_id;
         }
+        
+        ctx->config.is_manager = was_manager;  /* Restore manager flag */
         LOG_INFO("Set node %u as owner of %zu pages", ctx->node_id, num_pages);
     }
 
@@ -147,10 +146,10 @@ void* dsm_malloc(size_t size) {
             return addr;
         }
 
-        /* Wait for all nodes to ACK the allocation (with 2 second timeout - LAN optimized)
+        /* Wait for all nodes to ACK the allocation (with 10 second timeout for reliability)
          * This uses the shared alloc_tracker, which is now protected by allocation_lock */
         if (expected_acks > 0) {
-            rc = wait_for_alloc_acks(start_page_id, end_page_id, expected_acks, 2);
+            rc = wait_for_alloc_acks(start_page_id, end_page_id, expected_acks, 10);
             if (rc != DSM_SUCCESS) {
                 /* Log which nodes didn't ACK */
                 pthread_mutex_lock(&ctx->network.alloc_tracker.lock);

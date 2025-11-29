@@ -857,7 +857,11 @@ int handle_alloc_notify(const message_t *msg) {
         dir = get_page_directory();
     }
 
-    /* Register pages in directory with remote owner */
+    /* Register pages in directory with remote owner
+     * NOTE: Release ctx->lock before calling directory_set_owner to avoid
+     * deadlock - directory_set_owner may call network_send which also needs ctx->lock */
+    pthread_mutex_unlock(&ctx->lock);
+    
     if (dir) {
         for (page_id_t page_id = start_page_id; page_id <= end_page_id; page_id++) {
             directory_set_owner(dir, page_id, owner);
@@ -865,8 +869,6 @@ int handle_alloc_notify(const message_t *msg) {
         LOG_DEBUG("Registered %zu remote pages (owner=node %u) in directory",
                   num_pages, owner);
     }
-
-    pthread_mutex_unlock(&ctx->lock);
 
     LOG_INFO("SVAS setup complete: local addr=%p maps to remote pages %lu-%lu (owner=node %u)",
              addr, start_page_id, end_page_id, owner);
