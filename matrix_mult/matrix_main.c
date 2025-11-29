@@ -131,20 +131,38 @@ int main(int argc, char *argv[]) {
     /* PHASE 1: Allocation */
     display_section("PHASE 1: Memory Allocation");
 
-    /* Each node allocates its own A and C partitions (in parallel) */
-    display_action(node_id, ICON_MEM, "Allocating my partitions (A and C)...");
-    if (matrix_allocate_my_partitions(&state) != 0) {
-        display_action(node_id, ICON_CROSS, "Allocation failed");
-        dsm_finalize();
-        return 1;
-    }
-    double kb = (state.rows_per_node[node_id] * N * sizeof(double)) / 1024.0;
-    snprintf(info_msg, sizeof(info_msg), "Allocated %.1f KB per matrix", kb);
-    display_action(node_id, ICON_CHECK, info_msg);
-
-    /* Wait for all nodes to complete their allocations */
+    /* 
+     * Initial synchronization: Wait for all nodes to be connected and ready.
+     * This ensures the dispatcher thread on each node is running and can
+     * process ALLOC_NOTIFY messages before any allocations begin.
+     */
     dsm_barrier(BARRIER_ALLOC_A_BASE, num_nodes);
     display_barrier(BARRIER_ALLOC_A_BASE, num_nodes);
+
+    /* 
+     * Serialize allocations: Node 0 allocates first, then Node 1, etc.
+     * This avoids mutual deadlock where both nodes wait for ACKs from each other.
+     * The key insight: dsm_barrier() allows message processing while waiting,
+     * so the waiting node can respond to ALLOC_NOTIFY messages.
+     */
+    for (int i = 0; i < num_nodes; i++) {
+        if (node_id == i) {
+            display_action(node_id, ICON_MEM, "Allocating my partitions (A and C)...");
+            if (matrix_allocate_my_partitions(&state) != 0) {
+                display_action(node_id, ICON_CROSS, "Allocation failed");
+                dsm_finalize();
+                return 1;
+            }
+            double kb = (state.rows_per_node[i] * N * sizeof(double)) / 1024.0;
+            snprintf(info_msg, sizeof(info_msg), "Allocated %.1f KB per matrix", kb);
+            display_action(node_id, ICON_CHECK, info_msg);
+        }
+        /* All nodes synchronize - waiting nodes can process ALLOC_NOTIFY messages */
+        dsm_barrier(BARRIER_ALLOC_A_BASE + 1 + i, num_nodes);
+        if (i == node_id) {
+            display_barrier(BARRIER_ALLOC_A_BASE + 1 + i, num_nodes);
+        }
+    }
 
     display_divider();
     
