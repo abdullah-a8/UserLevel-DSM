@@ -18,6 +18,121 @@
 #include <unistd.h>
 #include <time.h>
 
+/* ============================ */
+/*   Network I/O Tracking       */
+/* ============================ */
+
+/**
+ * Calculate the size of a network message including framing overhead
+ *
+ * Network message format:
+ *   [4-byte length prefix][msg_header_t][payload]
+ *
+ * @param msg_type The message type
+ * @return Total bytes on wire (length prefix + header + payload)
+ */
+static inline size_t get_message_wire_size(msg_type_t msg_type) {
+    size_t size = 4 + sizeof(msg_header_t);  /* 4-byte length prefix + header */
+
+    switch (msg_type) {
+        case MSG_PAGE_REQUEST:
+            return size + sizeof(page_request_payload_t);
+        case MSG_PAGE_REPLY:
+            return size + sizeof(page_reply_payload_t);  /* Includes 4KB page data */
+        case MSG_INVALIDATE:
+            return size + sizeof(invalidate_payload_t);
+        case MSG_INVALIDATE_ACK:
+            return size + sizeof(invalidate_ack_payload_t);
+        case MSG_LOCK_REQUEST:
+            return size + sizeof(lock_request_payload_t);
+        case MSG_LOCK_GRANT:
+            return size + sizeof(lock_grant_payload_t);
+        case MSG_LOCK_RELEASE:
+            return size + sizeof(lock_release_payload_t);
+        case MSG_BARRIER_ARRIVE:
+            return size + sizeof(barrier_arrive_payload_t);
+        case MSG_BARRIER_RELEASE:
+            return size + sizeof(barrier_release_payload_t);
+        case MSG_ALLOC_NOTIFY:
+            return size + sizeof(alloc_notify_payload_t);
+        case MSG_ALLOC_ACK:
+            return size + sizeof(alloc_ack_payload_t);
+        case MSG_NODE_JOIN:
+            return size + sizeof(node_join_payload_t);
+        case MSG_NODE_LEAVE:
+            return size + sizeof(node_leave_payload_t);
+        case MSG_HEARTBEAT:
+            return size;  /* No payload */
+        case MSG_HEARTBEAT_ACK:
+            return size + sizeof(heartbeat_ack_payload_t);
+        case MSG_DIR_QUERY:
+            return size + sizeof(dir_query_payload_t);
+        case MSG_DIR_REPLY:
+            return size + sizeof(dir_reply_payload_t);
+        case MSG_OWNER_UPDATE:
+            return size + sizeof(owner_update_payload_t);
+        case MSG_NODE_FAILED:
+            return size + sizeof(node_failed_payload_t);
+        case MSG_SHARER_QUERY:
+            return size + sizeof(sharer_query_payload_t);
+        case MSG_SHARER_REPLY:
+            return size + sizeof(sharer_reply_payload_t);
+        case MSG_ERROR:
+            return size + sizeof(error_payload_t);
+        case MSG_STATE_SYNC_DIR:
+            return size + sizeof(state_sync_dir_payload_t);
+        case MSG_STATE_SYNC_LOCK:
+            return size + sizeof(state_sync_lock_payload_t);
+        case MSG_STATE_SYNC_BARRIER:
+            return size + sizeof(state_sync_barrier_payload_t);
+        case MSG_STATE_SYNC_NODE:
+            return size + sizeof(state_sync_node_payload_t);
+        case MSG_MANAGER_PROMOTION:
+            return size + sizeof(manager_promotion_payload_t);
+        case MSG_RECONNECT_REQUEST:
+            return size + sizeof(reconnect_request_payload_t);
+        default:
+            LOG_WARN("Unknown message type %d for size calculation", msg_type);
+            return size;  /* Return header size as fallback */
+    }
+}
+
+/**
+ * Track bytes sent on successful network_send()
+ * Thread-safe increment of network_bytes_sent counter
+ *
+ * @param msg_type The message type that was sent
+ */
+static inline void track_bytes_sent(msg_type_t msg_type) {
+    dsm_context_t *ctx = dsm_get_context();
+    if (!ctx) return;
+
+    size_t bytes = get_message_wire_size(msg_type);
+    pthread_mutex_lock(&ctx->stats_lock);
+    ctx->stats.network_bytes_sent += bytes;
+    pthread_mutex_unlock(&ctx->stats_lock);
+}
+
+/**
+ * Track bytes received when handling incoming message
+ * Thread-safe increment of network_bytes_received counter
+ *
+ * @param msg_type The message type that was received
+ */
+static inline void track_bytes_received(msg_type_t msg_type) {
+    dsm_context_t *ctx = dsm_get_context();
+    if (!ctx) return;
+
+    size_t bytes = get_message_wire_size(msg_type);
+    pthread_mutex_lock(&ctx->stats_lock);
+    ctx->stats.network_bytes_received += bytes;
+    pthread_mutex_unlock(&ctx->stats_lock);
+}
+
+/* ============================ */
+/*   Message Handlers           */
+/* ============================ */
+
 /* PAGE_REQUEST */
 int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) {
     dsm_context_t *ctx = dsm_get_context();
@@ -50,10 +165,17 @@ int send_page_request(node_id_t owner, page_id_t page_id, access_type_t access) 
 
     LOG_DEBUG("Sending PAGE_REQUEST for page %lu to node %u (final owner=node %u)",
               page_id, target, owner);
-    return network_send(target, &msg);
+    int rc = network_send(target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_PAGE_REQUEST);
+    }
+    return rc;
 }
 
 int handle_page_request(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_PAGE_REQUEST);
+
     page_id_t page_id = msg->payload.page_request.page_id;
     access_type_t access = msg->payload.page_request.access;
     node_id_t requester = msg->payload.page_request.requester;
@@ -292,10 +414,17 @@ int send_page_reply(node_id_t requester, page_id_t page_id, access_type_t access
 
     LOG_DEBUG("Sending PAGE_REPLY for page %lu to node %u (final requester=node %u, access=%s)",
               page_id, target, requester, access == ACCESS_READ ? "READ" : "WRITE");
-    return network_send(target, &msg);
+    int rc = network_send(target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_PAGE_REPLY);  /* ~4100 bytes including 4KB page data */
+    }
+    return rc;
 }
 
 int handle_page_reply(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_PAGE_REPLY);  /* ~4100 bytes including 4KB page data */
+
     page_id_t page_id = msg->payload.page_reply.page_id;
     uint64_t version = msg->payload.page_reply.version;
     access_type_t access = msg->payload.page_reply.access;
@@ -482,7 +611,11 @@ int send_invalidate(node_id_t target, page_id_t page_id) {
     msg.payload.invalidate.new_owner = ctx->node_id;
 
     LOG_DEBUG("Sending INVALIDATE for page %lu to node %u", page_id, target);
-    return network_send(target, &msg);
+    int rc = network_send(target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_INVALIDATE);
+    }
+    return rc;
 }
 
 int send_invalidate_ack(node_id_t target, page_id_t page_id) {
@@ -497,10 +630,17 @@ int send_invalidate_ack(node_id_t target, page_id_t page_id) {
     msg.payload.invalidate_ack.page_id = page_id;
     msg.payload.invalidate_ack.acker = ctx->node_id;
 
-    return network_send(target, &msg);
+    int rc = network_send(target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_INVALIDATE_ACK);
+    }
+    return rc;
 }
 
 int handle_invalidate(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_INVALIDATE);
+
     page_id_t page_id = msg->payload.invalidate.page_id;
     node_id_t new_owner = msg->payload.invalidate.new_owner;
 
@@ -568,6 +708,9 @@ int handle_invalidate(const message_t *msg) {
 }
 
 int handle_invalidate_ack(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_INVALIDATE_ACK);
+
     page_id_t page_id = msg->payload.invalidate_ack.page_id;
     node_id_t acker = msg->payload.invalidate_ack.acker;
 
@@ -623,7 +766,11 @@ int send_lock_request(node_id_t manager, lock_id_t lock_id) {
     msg.payload.lock_request.requester = ctx->node_id;
 
     LOG_DEBUG("Sending LOCK_REQUEST for lock %lu to node %u", lock_id, manager);
-    return network_send(manager, &msg);
+    int rc = network_send(manager, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_LOCK_REQUEST);
+    }
+    return rc;
 }
 
 int send_lock_grant(node_id_t grantee, lock_id_t lock_id) {
@@ -638,7 +785,11 @@ int send_lock_grant(node_id_t grantee, lock_id_t lock_id) {
     msg.payload.lock_grant.lock_id = lock_id;
     msg.payload.lock_grant.grantee = grantee;
 
-    return network_send(grantee, &msg);
+    int rc = network_send(grantee, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_LOCK_GRANT);
+    }
+    return rc;
 }
 
 int send_lock_release(node_id_t manager, lock_id_t lock_id) {
@@ -654,10 +805,17 @@ int send_lock_release(node_id_t manager, lock_id_t lock_id) {
     msg.payload.lock_release.releaser = ctx->node_id;
 
     LOG_DEBUG("Sending LOCK_RELEASE for lock %lu to node %u", lock_id, manager);
-    return network_send(manager, &msg);
+    int rc = network_send(manager, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_LOCK_RELEASE);
+    }
+    return rc;
 }
 
 int handle_lock_request(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_LOCK_REQUEST);
+
     lock_id_t lock_id = msg->payload.lock_request.lock_id;
     node_id_t requester = msg->payload.lock_request.requester;
 
@@ -669,6 +827,9 @@ int handle_lock_request(const message_t *msg) {
 }
 
 int handle_lock_grant(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_LOCK_GRANT);
+
     lock_id_t lock_id = msg->payload.lock_grant.lock_id;
     node_id_t grantee = msg->payload.lock_grant.grantee;
 
@@ -680,6 +841,9 @@ int handle_lock_grant(const message_t *msg) {
 }
 
 int handle_lock_release(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_LOCK_RELEASE);
+
     lock_id_t lock_id = msg->payload.lock_release.lock_id;
     node_id_t releaser = msg->payload.lock_release.releaser;
 
@@ -705,7 +869,11 @@ int send_barrier_arrive(node_id_t manager, barrier_id_t barrier_id, int num_part
     msg.payload.barrier_arrive.num_participants = num_participants;
 
     LOG_DEBUG("Sending BARRIER_ARRIVE for barrier %lu", barrier_id);
-    return network_send(manager, &msg);
+    int rc = network_send(manager, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_BARRIER_ARRIVE);
+    }
+    return rc;
 }
 
 int send_barrier_release(node_id_t node, barrier_id_t barrier_id) {
@@ -724,11 +892,16 @@ int send_barrier_release(node_id_t node, barrier_id_t barrier_id) {
     int rc = network_send(node, &msg);
     if (rc != DSM_SUCCESS) {
         LOG_ERROR("Failed to send BARRIER_RELEASE to node %u (rc=%d)", node, rc);
+    } else {
+        track_bytes_sent(MSG_BARRIER_RELEASE);
     }
     return rc;
 }
 
 int handle_barrier_arrive(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_BARRIER_ARRIVE);
+
     barrier_id_t barrier_id = msg->payload.barrier_arrive.barrier_id;
     node_id_t arriver = msg->payload.barrier_arrive.arriver;
     int num_participants = msg->payload.barrier_arrive.num_participants;
@@ -742,6 +915,9 @@ int handle_barrier_arrive(const message_t *msg) {
 }
 
 int handle_barrier_release(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_BARRIER_RELEASE);
+
     barrier_id_t barrier_id = msg->payload.barrier_release.barrier_id;
     LOG_INFO("Received BARRIER_RELEASE for barrier %lu from node %u",
              barrier_id, msg->header.sender);
@@ -791,6 +967,9 @@ int send_alloc_notify(page_id_t start_page_id, page_id_t end_page_id, node_id_t 
 }
 
 int handle_alloc_notify(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_ALLOC_NOTIFY);
+
     page_id_t start_page_id = msg->payload.alloc_notify.start_page_id;
     page_id_t end_page_id = msg->payload.alloc_notify.end_page_id;
     node_id_t owner = msg->payload.alloc_notify.owner;
@@ -946,10 +1125,17 @@ int send_alloc_ack(node_id_t target, page_id_t start_page_id, page_id_t end_page
     LOG_DEBUG("Sending ALLOC_ACK to node %u for pages %lu-%lu (final target=node %u)",
               send_target, start_page_id, end_page_id, target);
 
-    return network_send(send_target, &msg);
+    int rc = network_send(send_target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_ALLOC_ACK);
+    }
+    return rc;
 }
 
 int handle_alloc_ack(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_ALLOC_ACK);
+
     page_id_t start_page_id = msg->payload.alloc_ack.start_page_id;
     page_id_t end_page_id = msg->payload.alloc_ack.end_page_id;
     node_id_t acker = msg->payload.alloc_ack.acker;
@@ -1101,10 +1287,17 @@ int send_node_join(node_id_t node_id, const char *hostname, uint16_t port) {
     LOG_INFO("Sending NODE_JOIN to manager (node_id=%u, port=%u)", node_id, port);
 
     /* Send to manager (node 0) */
-    return network_send(0, &msg);
+    int rc = network_send(0, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_NODE_JOIN);
+    }
+    return rc;
 }
 
 int handle_node_join(const message_t *msg, int sockfd) {
+    /* Track received bytes */
+    track_bytes_received(MSG_NODE_JOIN);
+
     node_id_t joining_node_id = msg->payload.node_join.node_id;
     uint16_t port = msg->payload.node_join.port;
     const char *hostname = msg->payload.node_join.hostname;
@@ -1184,7 +1377,11 @@ int send_heartbeat(node_id_t target) {
     msg.header.type = MSG_HEARTBEAT;
     msg.header.sender = ctx->node_id;
 
-    return network_send(target, &msg);
+    int rc = network_send(target, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_HEARTBEAT);
+    }
+    return rc;
 }
 
 int handle_heartbeat(const message_t *msg) {
@@ -1383,7 +1580,11 @@ int send_dir_reply(node_id_t requester, page_id_t page_id, node_id_t owner) {
     msg.payload.dir_reply.page_id = page_id;
     msg.payload.dir_reply.owner = owner;
     
-    return network_send(requester, &msg);
+    int rc = network_send(requester, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_DIR_REPLY);
+    }
+    return rc;
 }
 
 int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner) {
@@ -1396,10 +1597,17 @@ int send_owner_update(node_id_t manager, page_id_t page_id, node_id_t new_owner)
     msg.payload.owner_update.page_id = page_id;
     msg.payload.owner_update.new_owner = new_owner;
     
-    return network_send(manager, &msg);
+    int rc = network_send(manager, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_OWNER_UPDATE);
+    }
+    return rc;
 }
 
 int handle_dir_query(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_DIR_QUERY);
+
     page_id_t page_id = msg->payload.dir_query.page_id;
     node_id_t requester = msg->payload.dir_query.requester;
 
@@ -1420,6 +1628,9 @@ int handle_dir_query(const message_t *msg) {
 }
 
 int handle_dir_reply(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_DIR_REPLY);
+
     page_id_t page_id = msg->payload.dir_reply.page_id;
     node_id_t owner = msg->payload.dir_reply.owner;
 
@@ -1440,6 +1651,9 @@ int handle_dir_reply(const message_t *msg) {
 }
 
 int handle_owner_update(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_OWNER_UPDATE);
+
     page_id_t page_id = msg->payload.owner_update.page_id;
     node_id_t new_owner = msg->payload.owner_update.new_owner;
     
@@ -1480,6 +1694,9 @@ int broadcast_node_failure(node_id_t failed_node) {
 }
 
 int handle_node_failed_msg(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_NODE_FAILED);
+
     node_id_t failed_node = msg->payload.node_failed.failed_node;
     dsm_context_t *ctx = dsm_get_context();
 
@@ -1510,10 +1727,17 @@ int send_sharer_query(node_id_t owner, page_id_t page_id) {
     msg.payload.sharer_query.requester = ctx->node_id;
 
     LOG_DEBUG("Querying node %u for sharers of page %lu", owner, page_id);
-    return network_send(owner, &msg);
+    int rc = network_send(owner, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_SHARER_QUERY);
+    }
+    return rc;
 }
 
 int handle_sharer_query(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_SHARER_QUERY);
+
     page_id_t page_id = msg->payload.sharer_query.page_id;
     node_id_t requester = msg->payload.sharer_query.requester;
 
@@ -1543,10 +1767,17 @@ int handle_sharer_query(const message_t *msg) {
 
     LOG_DEBUG("Sending SHARER_REPLY to node %u: page %lu has %d sharers",
              requester, page_id, num_sharers);
-    return network_send(requester, &reply);
+    int rc = network_send(requester, &reply);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_SHARER_REPLY);
+    }
+    return rc;
 }
 
 int handle_sharer_reply(const message_t *msg) {
+    /* Track received bytes */
+    track_bytes_received(MSG_SHARER_REPLY);
+
     page_id_t page_id = msg->payload.sharer_reply.page_id;
     int num_sharers = msg->payload.sharer_reply.num_sharers;
 
@@ -1717,7 +1948,11 @@ int send_state_sync_dir(page_id_t page_id, node_id_t owner, const node_id_t *sha
     }
 
     /* Async send to Node 1 (primary backup) */
-    return network_send(1, &msg);
+    int rc = network_send(1, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_STATE_SYNC_DIR);
+    }
+    return rc;
 }
 
 /**
@@ -1751,7 +1986,11 @@ int send_state_sync_lock(lock_id_t lock_id, node_id_t holder, const node_id_t *w
         msg.payload.state_sync_lock.waiters[i] = waiters[i];
     }
 
-    return network_send(1, &msg);
+    int rc = network_send(1, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_STATE_SYNC_LOCK);
+    }
+    return rc;
 }
 
 /**
@@ -1782,7 +2021,11 @@ int send_state_sync_barrier(barrier_id_t barrier_id, int num_arrived, int num_ex
     msg.payload.state_sync_barrier.num_expected = num_expected;
     msg.payload.state_sync_barrier.generation = generation;
 
-    return network_send(1, &msg);
+    int rc = network_send(1, &msg);
+    if (rc == DSM_SUCCESS) {
+        track_bytes_sent(MSG_STATE_SYNC_BARRIER);
+    }
+    return rc;
 }
 
 /**

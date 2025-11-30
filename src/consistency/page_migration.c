@@ -598,12 +598,12 @@ int fetch_page_write(page_id_t page_id) {
                 pthread_mutex_lock(&entry->entry_lock);
                 entry->pending_inv_acks--;
                 pthread_mutex_unlock(&entry->entry_lock);
+            } else {
+                /* Update stats only on successful send */
+                pthread_mutex_lock(&ctx->stats_lock);
+                ctx->stats.invalidations_sent++;
+                pthread_mutex_unlock(&ctx->stats_lock);
             }
-
-            /* Update stats */
-            pthread_mutex_lock(&ctx->stats_lock);
-            ctx->stats.invalidations_sent++;
-            pthread_mutex_unlock(&ctx->stats_lock);
         }
 
         /* Wait for all invalidation ACKs with timeout */
