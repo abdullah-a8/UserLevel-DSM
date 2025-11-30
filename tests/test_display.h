@@ -206,8 +206,8 @@ static inline void display_section(const char *title) {
     printf(BYEL "  ┌─");
     print_repeat("─", strlen(title) + 2);
     printf("─┐\n");
-    printf("  │ %s%s%s │\n", BWHT, title, BYEL);
-    printf("  └─");
+    printf("  │ %s%s%s │" RST "\n", BWHT, title, RST);
+    printf(BYEL "  └─");
     print_repeat("─", strlen(title) + 2);
     printf("─┘" RST "\n\n");
 }
@@ -217,9 +217,9 @@ static inline void display_section(const char *title) {
  */
 static inline void display_test_start(const char *test_name, const char *description) {
     printf(BCYN "  ┌─────────────────────────────────────────────────────┐\n");
-    printf("  │ " BWHT "%s TEST" BCYN "                                       \n", ICON_GEAR);
-    printf("  │ " BYEL "%-49s" BCYN " │\n", test_name);
-    printf("  │ " DIM "%-49s" BCYN " │\n", description);
+    printf("  │ " BWHT "%s TEST" RST "                                       " BCYN "│\n", ICON_GEAR);
+    printf("  │ " BYEL "%-49s" RST " " BCYN "│\n", test_name);
+    printf("  │ " DIM "%-49s" RST " " BCYN "│\n", description);
     printf("  └─────────────────────────────────────────────────────┘" RST "\n");
 }
 
@@ -302,11 +302,11 @@ static inline void display_lock_op(int node_id, const char *op, int lock_id) {
 static inline void display_test_result(const char *test_name, int passed) {
     if (passed) {
         printf("\n" BGRN "  ╔═══════════════════════════════════════════════════════╗\n");
-        printf("  ║   %s  TEST PASSED: %-35s ║\n", ICON_CHECK, test_name);
+        printf("  ║   %s  TEST PASSED: %-35s " RST BGRN "║\n", ICON_CHECK, test_name);
         printf("  ╚═══════════════════════════════════════════════════════╝" RST "\n\n");
     } else {
         printf("\n" BRED "  ╔═══════════════════════════════════════════════════════╗\n");
-        printf("  ║   %s  TEST FAILED: %-35s ║\n", ICON_CROSS, test_name);
+        printf("  ║   %s  TEST FAILED: %-35s " RST BRED "║\n", ICON_CROSS, test_name);
         printf("  ╚═══════════════════════════════════════════════════════╝" RST "\n\n");
     }
 }
@@ -346,13 +346,13 @@ static inline void display_node_info(int node_id, int is_manager, int num_nodes,
     
     printf("\n");
     printf("%s  ╔═══════════════════════════════════════╗\n", color);
-    printf("  ║  " BWHT "Node Configuration" "%s                  ║\n", color);
+    printf("  ║  " BWHT "Node Configuration" RST "                  %s║\n", color);
     printf("  ╠═══════════════════════════════════════╣\n");
-    printf("  ║  " RST "Node ID    : " BWHT "%-3d" "%s                    ║\n", node_id, color);
-    printf("  ║  " RST "Role       : " BWHT "%-8s" "%s               ║\n", role, color);
-    printf("  ║  " RST "Cluster    : " BWHT "%d nodes" "%s                  ║\n", num_nodes, color);
+    printf("  ║  " RST "Node ID    : " BWHT "%-3d" RST "                    %s║\n", node_id, color);
+    printf("  ║  " RST "Role       : " BWHT "%-8s" RST "               %s║\n", role, color);
+    printf("  ║  " RST "Cluster    : " BWHT "%d nodes" RST "                  %s║\n", num_nodes, color);
     if (!is_manager && host) {
-        printf("  ║  " RST "Manager    : " BWHT "%-20s" "%s  ║\n", host, color);
+        printf("  ║  " RST "Manager    : " BWHT "%-20s" RST "  %s║\n", host, color);
     }
     printf("  ╚═══════════════════════════════════════╝" RST "\n\n");
 }
@@ -370,13 +370,13 @@ static inline void display_stats_header(int node_id) {
     
     printf("\n");
     printf("%s  ╔═══════════════════════════════════════════════════════════╗\n", color);
-    printf("  ║" BWHT "            DSM PERFORMANCE STATISTICS" "%s                   ║\n", color);
-    printf("  ║" DGRY "                      Node %-2d" "%s                           ║\n", node_id, color);
+    printf("  ║" BWHT "            DSM PERFORMANCE STATISTICS" RST "                   %s║\n", color);
+    printf("  ║" DGRY "                      Node %-2d" RST "                           %s║\n", node_id, color);
     printf("  ╠═══════════════════════════════════════════════════════════╣" RST "\n");
 }
 
 static inline void display_stats_section(const char *title) {
-    printf(BYEL "  ║  " BWHT "%-53s" BYEL "    ║" RST "\n", title);
+    printf(BYEL "  ║  " BWHT "%-53s" RST "    " BYEL "║" RST "\n", title);
     printf(BYEL "  ╟───────────────────────────────────────────────────────────╢" RST "\n");
 }
 
@@ -389,11 +389,11 @@ static inline void display_stat_row(const char *label, uint64_t value, const cha
     } else {
         snprintf(line, sizeof(line), "  %-28s : %10lu         ", label, value);
     }
-    printf(BYEL "  ║" RST "  %-55s" BYEL "║" RST "\n", line);
+    printf(BYEL "  ║" RST "  %-55s  " BYEL "║" RST "\n", line);
 }
 
 static inline void display_stat_row_str(const char *label, const char *value) {
-    printf(BYEL "  ║  " RST "  %-30s : " BWHT "%-18s" RST " " BYEL "  ║" RST "\n", label, value);
+    printf(BYEL "  ║  " RST "  %-30s : " BWHT "%-18s" RST "   " BYEL "║" RST "\n", label, value);
 }
 
 static inline void display_stats_footer(void) {
@@ -406,34 +406,26 @@ static inline void display_stats_footer(void) {
 static inline void display_full_stats(int node_id, uint64_t page_faults, uint64_t read_faults,
                                        uint64_t write_faults, uint64_t pages_fetched,
                                        uint64_t pages_sent, uint64_t inv_sent, uint64_t inv_recv,
-                                       uint64_t bytes_sent, uint64_t bytes_recv,
-                                       uint64_t avg_latency_us, uint64_t max_latency_us,
-                                       uint64_t min_latency_us) {
+                                       uint64_t bytes_sent, uint64_t bytes_recv) {
     display_stats_header(node_id);
-    
+
     display_stats_section("Page Faults");
     display_stat_row("Total Page Faults", page_faults, "");
     display_stat_row("Read Faults", read_faults, "");
     display_stat_row("Write Faults", write_faults, "");
-    
+
     printf(BYEL "  ╟───────────────────────────────────────────────────────────╢" RST "\n");
     display_stats_section("Page Transfers");
     display_stat_row("Pages Fetched (incoming)", pages_fetched, "pages");
     display_stat_row("Pages Sent (outgoing)", pages_sent, "pages");
     display_stat_row("Invalidations Sent", inv_sent, "");
     display_stat_row("Invalidations Received", inv_recv, "");
-    
+
     printf(BYEL "  ╟───────────────────────────────────────────────────────────╢" RST "\n");
     display_stats_section("Network I/O");
     display_stat_row("Bytes Sent", bytes_sent, "bytes");
     display_stat_row("Bytes Received", bytes_recv, "bytes");
-    
-    printf(BYEL "  ╟───────────────────────────────────────────────────────────╢" RST "\n");
-    display_stats_section("Latency Metrics");
-    display_stat_row("Avg Fault Latency", avg_latency_us, "us");
-    display_stat_row("Max Fault Latency", max_latency_us, "us");
-    display_stat_row("Min Fault Latency", min_latency_us, "us");
-    
+
     display_stats_footer();
 }
 
@@ -460,30 +452,30 @@ static inline void display_test_summary(test_result_t *results, int num_tests, i
     
     printf("\n");
     printf(BCYN "  ╔═══════════════════════════════════════════════════════════╗\n");
-    printf("  ║" BWHT "                      TEST SUMMARY" BCYN "                        ║\n");
-    printf("  ║" DGRY "                        Node %-2d" BCYN "                          ║\n", node_id);
+    printf("  ║" BWHT "                      TEST SUMMARY" RST "                        " BCYN "║\n");
+    printf("  ║" DGRY "                        Node %-2d" RST "                          " BCYN "║\n", node_id);
     printf("  ╠═══════════════════════════════════════════════════════════╣\n");
     printf("  ║                                                           ║\n");
-    
+
     for (int i = 0; i < num_tests; i++) {
         char line[64];
         snprintf(line, sizeof(line), "%-50s", results[i].name);
         if (results[i].passed) {
-            printf("  ║   " BGRN "%s" BCYN "  %s  ║\n", ICON_CHECK, line);
+            printf("  ║   " BGRN "%s" RST "  %s  " BCYN "║\n", ICON_CHECK, line);
         } else {
-            printf("  ║   " BRED "%s" BCYN "  %s  ║\n", ICON_CROSS, line);
+            printf("  ║   " BRED "%s" RST "  %s  " BCYN "║\n", ICON_CROSS, line);
         }
     }
-    
+
     printf("  ║                                                           ║\n");
     printf("  ╠═══════════════════════════════════════════════════════════╣\n");
-    
+
     if (failed == 0) {
-        printf("  ║" BGRN "             All %d tests passed!  " BCYN "                        ║\n", passed);
+        printf("  ║" BGRN "             All %d tests passed!  " RST "                        " BCYN "║\n", passed);
     } else {
-        printf("  ║   " BYEL "Passed: %d" BCYN "  |  " BRED "Failed: %d" BCYN "                                   ║\n", passed, failed);
+        printf("  ║   " BYEL "Passed: %d" RST "  |  " BRED "Failed: %d" RST "                                   " BCYN "║\n", passed, failed);
     }
-    
+
     printf("  ╚═══════════════════════════════════════════════════════════╝" RST "\n\n");
 }
 

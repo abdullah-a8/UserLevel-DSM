@@ -682,11 +682,6 @@ int main(int argc, char *argv[]) {
     /* Display DSM statistics */
     dsm_stats_t stats;
     if (dsm_get_stats(&stats) == DSM_SUCCESS) {
-        uint64_t avg_latency = 0;
-        if (stats.page_faults > 0) {
-            avg_latency = stats.total_fault_latency_ns / stats.page_faults / 1000;
-        }
-        
         display_full_stats(node_id,
                           stats.page_faults,
                           stats.read_faults,
@@ -696,10 +691,7 @@ int main(int argc, char *argv[]) {
                           stats.invalidations_sent,
                           stats.invalidations_received,
                           stats.network_bytes_sent,
-                          stats.network_bytes_received,
-                          avg_latency,
-                          stats.max_fault_latency_ns / 1000,
-                          stats.min_fault_latency_ns / 1000);
+                          stats.network_bytes_received);
     }
 
     /* Cleanup */
