@@ -375,16 +375,16 @@ def run_live(config: VisualizerConfig, args: argparse.Namespace) -> None:
 
             # Check if simulation is complete
             if not monitor.is_running():
-                print("\nSimulation complete!")
+                if status != "COMPLETE":
+                    print("\nSimulation complete!")
+                    print("Press SPACE to close the window")
                 status = "COMPLETE"
-                # Keep rendering for a bit to show final state
-                for _ in range(30):  # 3 seconds at 10 FPS
-                    result = renderer.render(
-                        grid, stats, current_generation[0], paused=True, status=status
-                    )
-                    if result.should_quit:
-                        break
-                running = False
+                # Keep rendering and wait for user to press SPACE to close
+                result = renderer.render(
+                    grid, stats, current_generation[0], paused=False, status=status
+                )
+                if result.should_quit or result.toggle_pause:
+                    running = False
                 continue
 
             # Render current state with status
